@@ -18,15 +18,17 @@ SERVO_RIGHT_SCAN_ANGLE = 0
 SERVO_LEFT_SCAN_ANGLE = 20
 
 # Normal movement tuning
-ROBOT_SPEED = 16
-MIN_FOLLOW_SPEED = 13
-MAX_FOLLOW_SPEED = 20
+ROBOT_SPEED = 21
+MIN_FOLLOW_SPEED = 18
+MAX_FOLLOW_SPEED = 25
 
 # Pivot/turn speed while following line
 LINE_TURN_SPEED = 24
 
-# Lost-line recovery turn speed
-RECOVERY_TURN_SPEED = 30
+# Lost-line recovery turn speed.
+# Slightly lower speed with a longer sweep gives a smoother search
+# rotation instead of short violent bursts.
+RECOVERY_TURN_SPEED = 26
 
 # Send serial commands fast enough for live line following
 COMMAND_SEND_INTERVAL = 0.02
@@ -36,15 +38,46 @@ SAME_COMMAND_INTERVAL = 0.05
 # ----------------------------
 # Lost-line recovery behavior
 # ----------------------------
-LOST_LINE_START_SECONDS = 0.18
+# Wait a bit before declaring the line lost, so short detection
+# dropouts do not snap the servo and restart recovery over and over.
+LOST_LINE_START_SECONDS = 0.35
 
 # Reasonable recovery turn duration.
 # Increase if it does not rotate enough.
 # Decrease if it rotates too much.
-RECOVERY_TURN_SECONDS = 0.42
+RECOVERY_TURN_SECONDS = 0.50
 
 # Stop and let camera check.
-RECOVERY_CHECK_SECONDS = 1.20
+RECOVERY_CHECK_SECONDS = 0.80
+
+
+# ----------------------------
+# Smoothness tuning
+# ----------------------------
+# Blend factor for the steering error (0..1).
+# Lower = smoother steering, higher = faster reaction.
+ERROR_SMOOTHING_ALPHA = 0.6
+
+# While pivoting, only switch back to FORWARD once the error is within
+# CENTER_TOLERANCE * TURN_RELEASE_RATIO.
+# This hysteresis stops the rapid F/Q/E flickering right at the
+# tolerance edge.
+TURN_RELEASE_RATIO = 0.6
+
+# Line must be visible this many consecutive frames before leaving
+# recovery, so one noisy frame does not flap the mode and the servo.
+RECOVERY_EXIT_FOUND_FRAMES = 3
+
+# Minimum seconds between physical servo moves.
+# Stops the servo from being hammered with rapid angle changes.
+SERVO_MOVE_MIN_INTERVAL = 0.5
+
+# Shift the steering reference (the yellow center line) left/right,
+# in detection pixels (at DETECT_WIDTH=320).
+# Use this if the camera is mounted slightly off-center and the center
+# line does not sit on the ground line even when the robot is centered.
+# Negative = move reference left, positive = move right.
+CENTER_OFFSET_PX = 0
 
 
 # ----------------------------
@@ -203,6 +236,10 @@ recovery_mode = False
 recovery_phase = "NORMAL"
 recovery_phase_started_at = 0.0
 servo_angle_now = SERVO_DEFAULT_ANGLE
+servo_last_moved_at = 0.0
+recovery_found_streak = 0
+smoothed_error = 0.0
+last_follow_action = None
 
 
 def set_recovery_phase(phase):
@@ -214,25 +251,38 @@ def set_recovery_phase(phase):
 
 
 def set_servo_angle(angle):
-    global servo_angle_now
+    global servo_angle_now, servo_last_moved_at
 
-    if servo_angle_now != angle:
-        servo_angle_now = angle
-        robot.send_servo(angle, force=True)
+    if servo_angle_now == angle:
+        return
+
+    # Rate-limit physical servo moves. Callers re-assert the angle every
+    # frame, so a skipped move is retried once the interval has passed.
+    now = time.time()
+    if now - servo_last_moved_at < SERVO_MOVE_MIN_INTERVAL:
+        return
+
+    servo_angle_now = angle
+    servo_last_moved_at = now
+    robot.send_servo(angle, force=True)
 
 
 def start_recovery():
-    global recovery_mode
+    global recovery_mode, recovery_found_streak, last_follow_action
 
     recovery_mode = True
+    recovery_found_streak = 0
+    last_follow_action = None
     set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
     set_recovery_phase("TURN_RIGHT")
 
 
 def stop_recovery():
-    global recovery_mode
+    global recovery_mode, recovery_found_streak, smoothed_error
 
     recovery_mode = False
+    recovery_found_streak = 0
+    smoothed_error = 0.0
     set_servo_angle(SERVO_DEFAULT_ANGLE)
     set_recovery_phase("NORMAL")
 
@@ -368,14 +418,18 @@ def detect_line(frame):
 
     found_line = bottom["found"] or lookahead["found"]
 
+    # Steering reference. Shift with CENTER_OFFSET_PX if the camera is
+    # mounted slightly off-center.
+    reference_x = (w // 2) + CENTER_OFFSET_PX
+
     bottom_error = 0
     lookahead_error = 0
 
     if bottom["found"]:
-        bottom_error = bottom["center_x"] - (w // 2)
+        bottom_error = bottom["center_x"] - reference_x
 
     if lookahead["found"]:
-        lookahead_error = lookahead["center_x"] - (w // 2)
+        lookahead_error = lookahead["center_x"] - reference_x
 
     # Combine current position and upcoming curve.
     # Bottom is most important, lookahead helps early turn.
@@ -401,6 +455,7 @@ def detect_line(frame):
         "found_line": found_line,
         "bottom": bottom,
         "lookahead": lookahead,
+        "reference_x": reference_x,
         "bottom_error": bottom_error,
         "lookahead_error": lookahead_error,
         "weighted_error": weighted_error,
@@ -415,10 +470,28 @@ def detect_line(frame):
 # Decision logic
 # ----------------------------
 def choose_follow_command(detection):
-    error = detection["weighted_error"]
+    global smoothed_error, last_follow_action
+
+    # Smooth the steering error so a single noisy frame does not flip
+    # the command back and forth.
+    smoothed_error = (
+        ERROR_SMOOTHING_ALPHA * detection["weighted_error"]
+        + (1.0 - ERROR_SMOOTHING_ALPHA) * smoothed_error
+    )
+
+    error = smoothed_error
     abs_error = abs(error)
 
-    if abs_error <= CENTER_TOLERANCE:
+    # Hysteresis: while already pivoting, keep pivoting until the line
+    # is well inside the tolerance band instead of flapping at the edge.
+    was_turning = last_follow_action is not None and last_follow_action[1] in ("Q", "E")
+
+    if was_turning:
+        forward_tolerance = CENTER_TOLERANCE * TURN_RELEASE_RATIO
+    else:
+        forward_tolerance = CENTER_TOLERANCE
+
+    if abs_error <= forward_tolerance:
         decision = "FORWARD"
         command = "F"
 
@@ -429,7 +502,8 @@ def choose_follow_command(detection):
         else:
             speed = ROBOT_SPEED
 
-        return decision, command, speed
+        last_follow_action = (decision, command, speed)
+        return last_follow_action
 
     # Dynamic turn speed based on how far line is from center.
     # Stronger error = stronger pivot.
@@ -443,24 +517,37 @@ def choose_follow_command(detection):
     turn_speed = max(18, min(32, turn_speed))
 
     if error < 0:
-        return "PIVOT LEFT", "Q", turn_speed
+        last_follow_action = ("PIVOT LEFT", "Q", turn_speed)
+    else:
+        last_follow_action = ("PIVOT RIGHT", "E", turn_speed)
 
-    return "PIVOT RIGHT", "E", turn_speed
+    return last_follow_action
 
 
 def choose_recovery_command(detection):
-    global last_line_seen_at
+    global last_line_seen_at, recovery_found_streak
 
     now = time.time()
     elapsed = now - recovery_phase_started_at
 
     # Found line during recovery.
+    # Require a few consecutive frames before leaving recovery, so one
+    # noisy frame does not flap the mode and the servo.
     if detection["found_line"]:
         last_line_seen_at = now
-        stop_recovery()
-        return choose_follow_command(detection)
+        recovery_found_streak += 1
+
+        if recovery_found_streak >= RECOVERY_EXIT_FOUND_FRAMES:
+            stop_recovery()
+            return choose_follow_command(detection)
+
+        return "RECOVERY CONFIRM LINE", "S", 0
+
+    recovery_found_streak = 0
 
     if recovery_phase == "TURN_RIGHT":
+        set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
+
         if elapsed < RECOVERY_TURN_SECONDS:
             return "RECOVERY TURN RIGHT", "E", RECOVERY_TURN_SPEED
 
@@ -472,14 +559,13 @@ def choose_recovery_command(detection):
         if elapsed < RECOVERY_CHECK_SECONDS:
             return "RECOVERY CHECK RIGHT", "S", 0
 
-        set_servo_angle(SERVO_DEFAULT_ANGLE)
-        time.sleep(0.08)
-
         set_servo_angle(SERVO_LEFT_SCAN_ANGLE)
         set_recovery_phase("TURN_LEFT")
         return "RECOVERY PREP LEFT", "S", 0
 
     if recovery_phase == "TURN_LEFT":
+        set_servo_angle(SERVO_LEFT_SCAN_ANGLE)
+
         if elapsed < RECOVERY_TURN_SECONDS:
             return "RECOVERY TURN LEFT", "Q", RECOVERY_TURN_SPEED
 
@@ -520,6 +606,12 @@ def decide_robot_action(detection):
     if time_since_line_seen >= LOST_LINE_START_SECONDS:
         start_recovery()
         return "START RECOVERY", "S", 0
+
+    # Briefly keep the last follow action instead of hard-stopping, so a
+    # short detection dropout does not jerk the robot.
+    if last_follow_action is not None:
+        decision, command, speed = last_follow_action
+        return "LINE LOST COAST", command, speed
 
     return "LINE LOST WAIT", "S", 0
 
@@ -566,7 +658,8 @@ def draw_debug(frame, detection, decision, command, speed):
         color = (0, 0, 255)
 
     # Draw center/tolerance lines based on stream size.
-    center_x = w // 2
+    # Uses the (possibly offset) steering reference, not the raw middle.
+    center_x = int(detection["reference_x"] * scale_x)
     tolerance_full = int(CENTER_TOLERANCE * scale_x)
 
     cv2.line(frame, (center_x, 0), (center_x, h), (255, 255, 0), 2)
