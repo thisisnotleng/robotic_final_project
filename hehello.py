@@ -3,10 +3,8 @@ import cv2
 import numpy as np
 import serial
 import time
-import onnxruntime as ort
 
-app = Flask(name)
-model = ort.InferenceSession("best.onnx")
+app = Flask(__name__)
 
 ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
 time.sleep(2) 
@@ -191,7 +189,8 @@ def generate_frames():
                 decision = "Obstacle"
 
                 current_time = time.time()
-if search_end_time == 0:
+
+                if search_end_time == 0:
                     search_end_time = current_time + 2
 
                 if current_time < search_end_time:
@@ -289,5 +288,5 @@ def video():
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-if name == "main":
+if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000)
