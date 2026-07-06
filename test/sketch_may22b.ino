@@ -43,9 +43,21 @@
 #define ULTRASONIC_TRIG 13
 #define ULTRASONIC_ECHO 39
 
+// Automatic distance reporting.
+// One short sample per interval keeps loop() responsive, and the
+// Python side receives "DIST:<cm>" lines without having to ask.
+#define ULTRASONIC_INTERVAL_MS 60
+
+// Echo timeout ~1m max range. A short timeout keeps each sample fast
+// (max ~6ms) so motor ramping stays smooth.
+#define ULTRASONIC_TIMEOUT_US 6000
+
 #define SERVO_MIN_ANGLE 0
 #define SERVO_MAX_ANGLE 180
-#define SERVO_DEFAULT_ANGLE 90
+
+// Camera looks down at the line by default.
+// Python lifts it to 10 when the ultrasonic sees an obstacle.
+#define SERVO_DEFAULT_ANGLE 0
 
 Servo cameraServo;
 
@@ -108,6 +120,12 @@ int currentSpeed = DEFAULT_SPEED;
 unsigned long lastCommandAt = 0;
 unsigned long lastControlUpdate = 0;
 
+// Rolling ultrasonic samples for a simple median filter.
+unsigned long lastUltrasonicAt = 0;
+float distanceSamples[3] = {-1, -1, -1};
+int distanceSampleIndex = 0;
+float lastMedianDistanceCm = -1;
+
 // -------------------- Function declarations --------------------
 
 void setupMotorPins();
@@ -139,7 +157,8 @@ int scaledSpeed(int speed, int percent);
 int speedToPwm(int speed);
 
 void setServoAngle(int angle);
-float readUltrasonicCm();
+void updateUltrasonic();
+float medianDistanceCm();
 float readUltrasonicSampleCm();
 
 void printDebug(const char* message);
@@ -167,6 +186,7 @@ void loop() {
   }
 
   updateSmoothMotors();
+  updateUltrasonic();
 }
 
 // -------------------- Setup helpers --------------------
@@ -252,9 +272,9 @@ void handleCommand(String command) {
   } else if (action == 'A') {
     setServoAngle(value);
   } else if (action == 'U') {
-    float distance = readUltrasonicCm();
+    // Report the latest filtered distance without blocking.
     Serial.print("DIST:");
-    Serial.println(distance);
+    Serial.println(lastMedianDistanceCm);
   } else {
     smoothStop();
     Serial.print("Unknown command: ");
@@ -504,19 +524,34 @@ void setServoAngle(int angle) {
 
 // -------------------- Ultrasonic --------------------
 
-float readUltrasonicCm() {
-  float samples[3];
+// Take one fast sample per interval and keep a median of the last 3.
+// This spreads the sensor cost over time so motor control stays smooth,
+// and pushes "DIST:<cm>" to the Python side automatically.
+void updateUltrasonic() {
+  if (millis() - lastUltrasonicAt < ULTRASONIC_INTERVAL_MS) {
+    return;
+  }
+
+  lastUltrasonicAt = millis();
+
+  distanceSamples[distanceSampleIndex] = readUltrasonicSampleCm();
+  distanceSampleIndex = (distanceSampleIndex + 1) % 3;
+
+  lastMedianDistanceCm = medianDistanceCm();
+
+  Serial.print("DIST:");
+  Serial.println(lastMedianDistanceCm);
+}
+
+float medianDistanceCm() {
+  float valid[3];
   int validCount = 0;
 
   for (int i = 0; i < 3; i++) {
-    float distanceCm = readUltrasonicSampleCm();
-
-    if (distanceCm > 0) {
-      samples[validCount] = distanceCm;
+    if (distanceSamples[i] > 0) {
+      valid[validCount] = distanceSamples[i];
       validCount++;
     }
-
-    delay(8);
   }
 
   if (validCount == 0) {
@@ -525,15 +560,15 @@ float readUltrasonicCm() {
 
   for (int i = 0; i < validCount - 1; i++) {
     for (int j = i + 1; j < validCount; j++) {
-      if (samples[j] < samples[i]) {
-        float temp = samples[i];
-        samples[i] = samples[j];
-        samples[j] = temp;
+      if (valid[j] < valid[i]) {
+        float temp = valid[i];
+        valid[i] = valid[j];
+        valid[j] = temp;
       }
     }
   }
 
-  return samples[validCount / 2];
+  return valid[validCount / 2];
 }
 
 float readUltrasonicSampleCm() {
@@ -544,7 +579,7 @@ float readUltrasonicSampleCm() {
   delayMicroseconds(10);
   digitalWrite(ULTRASONIC_TRIG, LOW);
 
-  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, 30000);
+  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, ULTRASONIC_TIMEOUT_US);
 
   if (duration == 0) {
     return -1;

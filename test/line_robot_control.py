@@ -13,9 +13,15 @@ SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
 # Servo angles
-SERVO_DEFAULT_ANGLE = 10
+# Camera looks down at the line by default. It only lifts to
+# SERVO_OBSTACLE_ANGLE while an obstacle is blocking the path.
+SERVO_DEFAULT_ANGLE = 0
+SERVO_OBSTACLE_ANGLE = 10
+
+# Recovery no longer tilts the camera; keeping both scan angles at the
+# default means the servo stays still while searching for the line.
 SERVO_RIGHT_SCAN_ANGLE = 0
-SERVO_LEFT_SCAN_ANGLE = 20
+SERVO_LEFT_SCAN_ANGLE = 0
 
 # Normal movement tuning
 ROBOT_SPEED = 21
@@ -78,6 +84,29 @@ SERVO_MOVE_MIN_INTERVAL = 0.5
 # line does not sit on the ground line even when the robot is centered.
 # Negative = move reference left, positive = move right.
 CENTER_OFFSET_PX = 0
+
+
+# ----------------------------
+# Obstacle detection (ultrasonic)
+# ----------------------------
+# The firmware pushes "DIST:<cm>" lines automatically (~every 60ms).
+
+# Stop when an obstacle is at or closer than this.
+OBSTACLE_STOP_CM = 25.0
+
+# Resume only once the path opens beyond this. The gap between stop and
+# clear is hysteresis, so the robot does not flap right at 25cm.
+OBSTACLE_CLEAR_CM = 32.0
+
+# Consecutive readings below OBSTACLE_STOP_CM before stopping,
+# so one noisy echo does not halt the robot.
+OBSTACLE_CONFIRM_READINGS = 2
+
+# Path must stay clear this long before resuming.
+OBSTACLE_CLEAR_SECONDS = 0.5
+
+# Ignore distance readings older than this (serial hiccup safety).
+ULTRASONIC_STALE_SECONDS = 1.0
 
 
 # ----------------------------
@@ -158,6 +187,10 @@ class RobotSerial:
         self.last_sent_at = 0.0
         self.lock = threading.Lock()
 
+        self.rx_buffer = ""
+        self.last_distance_cm = None
+        self.last_distance_at = 0.0
+
         try:
             self.ser = serial.Serial(port, baud_rate, timeout=0.05)
             time.sleep(2)
@@ -192,6 +225,47 @@ class RobotSerial:
     def send_servo(self, angle, force=False):
         angle = int(max(0, min(180, angle)))
         self.send("A", angle, force=force)
+
+    def poll_responses(self):
+        # Non-blocking read of firmware output.
+        # We only care about the auto-pushed "DIST:<cm>" lines.
+        if not self.ser or not self.ser.is_open:
+            return
+
+        try:
+            with self.lock:
+                waiting = self.ser.in_waiting
+                data = self.ser.read(waiting) if waiting > 0 else b""
+        except (serial.SerialException, OSError) as exc:
+            print(f"Serial read failed: {exc}")
+            return
+
+        if not data:
+            return
+
+        self.rx_buffer += data.decode("utf-8", errors="ignore")
+
+        while "\n" in self.rx_buffer:
+            line, self.rx_buffer = self.rx_buffer.split("\n", 1)
+            line = line.strip()
+
+            if line.startswith("DIST:"):
+                try:
+                    self.last_distance_cm = float(line[5:])
+                    self.last_distance_at = time.time()
+                except ValueError:
+                    pass
+
+    def get_distance(self):
+        # Returns (distance_cm, measured_at). (None, 0.0) when unknown.
+        # distance_cm <= 0 means no echo (nothing in sensor range).
+        if self.last_distance_cm is None:
+            return None, 0.0
+
+        if time.time() - self.last_distance_at > ULTRASONIC_STALE_SECONDS:
+            return None, 0.0
+
+        return self.last_distance_cm, self.last_distance_at
 
     def _write_payload(self, payload):
         if not self.ser or not self.ser.is_open:
@@ -241,6 +315,12 @@ recovery_found_streak = 0
 smoothed_error = 0.0
 last_follow_action = None
 
+# Obstacle state
+obstacle_mode = False
+obstacle_below_count = 0
+obstacle_clear_since = None
+obstacle_last_reading_at = 0.0
+
 
 def set_recovery_phase(phase):
     global recovery_phase, recovery_phase_started_at
@@ -285,6 +365,77 @@ def stop_recovery():
     smoothed_error = 0.0
     set_servo_angle(SERVO_DEFAULT_ANGLE)
     set_recovery_phase("NORMAL")
+
+
+# ----------------------------
+# Obstacle handling
+# ----------------------------
+def enter_obstacle_mode():
+    global obstacle_mode, obstacle_clear_since, recovery_mode, last_follow_action
+
+    obstacle_mode = True
+    obstacle_clear_since = None
+    last_follow_action = None
+
+    # Abandon any recovery; it restarts fresh if the line is still lost
+    # after the obstacle clears.
+    if recovery_mode:
+        recovery_mode = False
+        set_recovery_phase("NORMAL")
+
+    robot.send("S", force=True)
+    set_servo_angle(SERVO_OBSTACLE_ANGLE)
+    print("Obstacle detected: robot stopped, servo lifted.")
+
+
+def exit_obstacle_mode():
+    global obstacle_mode, obstacle_below_count, last_line_seen_at
+
+    obstacle_mode = False
+    obstacle_below_count = 0
+    set_servo_angle(SERVO_DEFAULT_ANGLE)
+
+    # Give the camera a fresh lost-line window so recovery does not fire
+    # the instant the robot resumes.
+    last_line_seen_at = time.time()
+    print("Obstacle cleared: resuming line following.")
+
+
+def update_obstacle_state():
+    global obstacle_below_count, obstacle_clear_since, obstacle_last_reading_at
+
+    distance, measured_at = robot.get_distance()
+
+    # No fresh reading, or this reading was already processed:
+    # keep the current state.
+    if distance is None or measured_at <= obstacle_last_reading_at:
+        return
+
+    obstacle_last_reading_at = measured_at
+
+    # distance <= 0 means no echo, i.e. nothing in sensor range.
+    blocked = 0 < distance <= OBSTACLE_STOP_CM
+
+    if not obstacle_mode:
+        if blocked:
+            obstacle_below_count += 1
+
+            if obstacle_below_count >= OBSTACLE_CONFIRM_READINGS:
+                enter_obstacle_mode()
+        else:
+            obstacle_below_count = 0
+
+        return
+
+    now = time.time()
+
+    if distance <= 0 or distance > OBSTACLE_CLEAR_CM:
+        if obstacle_clear_since is None:
+            obstacle_clear_since = now
+        elif now - obstacle_clear_since >= OBSTACLE_CLEAR_SECONDS:
+            exit_obstacle_mode()
+    else:
+        obstacle_clear_since = None
 
 
 # ----------------------------
@@ -590,6 +741,13 @@ def decide_robot_action(detection):
 
     now = time.time()
 
+    if obstacle_mode:
+        # Hold position with the camera lifted. Keep the line timer
+        # fresh so recovery does not fire the moment the path clears.
+        set_servo_angle(SERVO_OBSTACLE_ANGLE)
+        last_line_seen_at = now
+        return "OBSTACLE STOP", "S", 0
+
     if recovery_mode:
         return choose_recovery_command(detection)
 
@@ -650,7 +808,9 @@ def draw_debug(frame, detection, decision, command, speed):
     scale_x = detection["scale_x"]
     scale_y = detection["scale_y"]
 
-    if detection["found_line"]:
+    if obstacle_mode:
+        color = (0, 0, 255)
+    elif detection["found_line"]:
         color = (0, 255, 0)
     elif recovery_mode:
         color = (0, 255, 255)
@@ -714,9 +874,25 @@ def draw_debug(frame, detection, decision, command, speed):
         2,
     )
 
+    if obstacle_mode:
+        mode_text = "OBSTACLE"
+    elif recovery_mode:
+        mode_text = "RECOVERY"
+    else:
+        mode_text = "FOLLOW"
+
+    distance_cm, _ = robot.get_distance()
+
+    if distance_cm is None:
+        distance_text = "--"
+    elif distance_cm <= 0:
+        distance_text = "CLEAR"
+    else:
+        distance_text = f"{distance_cm:.0f}cm"
+
     cv2.putText(
         frame,
-        f"MODE {'RECOVERY' if recovery_mode else 'FOLLOW'} | PHASE {recovery_phase} | DETECT {DETECT_WIDTH}x{DETECT_HEIGHT}",
+        f"MODE {mode_text} | PHASE {recovery_phase} | DIST {distance_text}",
         (10, 124),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.54,
@@ -852,6 +1028,9 @@ def camera_control_loop():
             # Some cameras ignore requested resolution, so resize stream frame for consistency.
             if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
                 frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+
+            robot.poll_responses()
+            update_obstacle_state()
 
             detection = detect_line(frame)
             decision, command, speed = decide_robot_action(detection)
