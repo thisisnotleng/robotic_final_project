@@ -15,9 +15,10 @@
 #define RAMP_STEP_UP 4
 #define RAMP_STEP_DOWN 8
 
-// Keep serial speeds literal so Python controls motor power directly.
+// Keep serial speeds literal for control logic, but lift nonzero PWM
+// above motor stall torque so all wheels actually start moving.
 #define MIN_ACTIVE_SPEED 1
-#define MIN_ACTIVE_PWM 1
+#define MIN_ACTIVE_PWM 55
 
 // Python already chooses safe line-following speeds.
 #define MAX_DRIVE_SPEED 100
@@ -25,13 +26,12 @@
 // Python also chooses pivot/search speeds.
 #define MAX_PIVOT_SPEED 100
 
-// Smooth curve turning.
-// Inner wheels still move forward, but slower.
-#define TURN_INNER_PERCENT 45
+// Arc turning.
+// Inner wheels stop, outer wheels move forward.
 
 // Pivot turning.
-// One side forward, one side backward.
-// This makes rotation smoother by slightly reducing power.
+// Inner wheels stop, outer wheels move forward.
+// This keeps rotation from dragging the opposite side backward.
 #define PIVOT_PERCENT 100
 
 // -------------------- Servo and ultrasonic pins --------------------
@@ -57,7 +57,7 @@
 
 // Camera looks down at the line by default.
 // Python lifts it to 10 when the ultrasonic sees an obstacle.
-#define SERVO_DEFAULT_ANGLE 0
+#define SERVO_DEFAULT_ANGLE 5
 
 Servo cameraServo;
 
@@ -312,64 +312,61 @@ void backward(int speed) {
 
 void turnLeft(int speed) {
   speed = cleanSpeed(speed, MAX_DRIVE_SPEED);
-  int innerSpeed = scaledSpeed(speed, TURN_INNER_PERCENT);
 
-  // Left side slower, right side faster.
-  // This is a smooth curve, not a spin.
+  // Left side stopped, right side forward.
   setTargetAll(
-    innerSpeed,
+    0,
     speed,
-    innerSpeed,
+    0,
     speed
   );
 
-  printDebug("Smooth left");
+  printDebug("Arc left");
 }
 
 void turnRight(int speed) {
   speed = cleanSpeed(speed, MAX_DRIVE_SPEED);
-  int innerSpeed = scaledSpeed(speed, TURN_INNER_PERCENT);
 
-  // Right side slower, left side faster.
+  // Left side forward, right side stopped.
   setTargetAll(
     speed,
-    innerSpeed,
+    0,
     speed,
-    innerSpeed
+    0
   );
 
-  printDebug("Smooth right");
+  printDebug("Arc right");
 }
 
 void pivotLeft(int speed) {
   speed = cleanSpeed(speed, MAX_PIVOT_SPEED);
   int pivotSpeed = scaledSpeed(speed, PIVOT_PERCENT);
 
-  // Left side backward, right side forward.
+  // Left side stopped, right side forward.
   // Soft pivot for finding lost line.
   setTargetAll(
-    -pivotSpeed,
+    0,
     pivotSpeed,
-    -pivotSpeed,
+    0,
     pivotSpeed
   );
 
-  printDebug("Soft pivot left");
+  printDebug("One-side pivot left");
 }
 
 void pivotRight(int speed) {
   speed = cleanSpeed(speed, MAX_PIVOT_SPEED);
   int pivotSpeed = scaledSpeed(speed, PIVOT_PERCENT);
 
-  // Left side forward, right side backward.
+  // Left side forward, right side stopped.
   setTargetAll(
     pivotSpeed,
-    -pivotSpeed,
+    0,
     pivotSpeed,
-    -pivotSpeed
+    0
   );
 
-  printDebug("Soft pivot right");
+  printDebug("One-side pivot right");
 }
 
 void smoothStop() {
@@ -509,7 +506,8 @@ int speedToPwm(int speed) {
     return 0;
   }
 
-  return map(speed, 0, 100, 0, 255);
+  int pwmValue = map(speed, 0, 100, 0, 255);
+  return max(pwmValue, MIN_ACTIVE_PWM);
 }
 
 // -------------------- Servo --------------------

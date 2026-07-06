@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/thisisnotleng/Desktop/AUPP/SUMMER 2026/Robotics/Project",
+      "program": "/Users/thisisnotleng/Desktop/AUPP/SUMMER 2026/Robotics/Project/build/Debug/outDebug"
+    }
+  ]
+}

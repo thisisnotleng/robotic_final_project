@@ -16,25 +16,27 @@ BAUD_RATE = 115200
 # Camera looks down at the line by default. It only lifts to
 # SERVO_OBSTACLE_ANGLE while an obstacle is blocking the path.
 SERVO_DEFAULT_ANGLE = 0
-SERVO_OBSTACLE_ANGLE = 10
+SERVO_OBSTACLE_ANGLE = 15
 
 # Recovery no longer tilts the camera; keeping both scan angles at the
 # default means the servo stays still while searching for the line.
-SERVO_RIGHT_SCAN_ANGLE = 0
-SERVO_LEFT_SCAN_ANGLE = 0
+SERVO_RIGHT_SCAN_ANGLE = SERVO_DEFAULT_ANGLE
+SERVO_LEFT_SCAN_ANGLE = SERVO_DEFAULT_ANGLE
 
 # Normal movement tuning
-ROBOT_SPEED = 21
-MIN_FOLLOW_SPEED = 18
+ROBOT_SPEED = 17
+MIN_FOLLOW_SPEED = 10
 MAX_FOLLOW_SPEED = 25
 
-# Pivot/turn speed while following line
-LINE_TURN_SPEED = 24
+# Pivot/turn speed while following line.
+# Keep this gentle; the camera view shows pure pivots can overshoot the
+# center quickly and throw the line out of frame.
+LINE_TURN_SPEED = 15
 
 # Lost-line recovery turn speed.
-# Slightly lower speed with a longer sweep gives a smoother search
-# rotation instead of short violent bursts.
-RECOVERY_TURN_SPEED = 26
+# Keep recovery slower than before so it can reacquire the line without
+# sweeping past it too quickly.
+RECOVERY_TURN_SPEED = 18
 
 # Send serial commands fast enough for live line following
 COMMAND_SEND_INTERVAL = 0.02
@@ -138,9 +140,18 @@ JPEG_QUALITY = 78
 # Line detection configuration
 # ----------------------------
 
-# Use grayscale black detection, faster and usually cleaner than HSV for black line.
-# If your line is missed, increase this from 80 to 90/100.
-BLACK_THRESHOLD = 85
+# Use grayscale dark-line detection, faster and usually cleaner than HSV
+# for this floor. The tape appears as dark gray in the camera, so this
+# cannot be too low or the robot will miss the line.
+BLACK_THRESHOLD = 135
+
+# Also require local contrast: the line must be this much darker than the
+# nearby floor/wall around it. Keep this gentle because the tape is broad
+# enough that an aggressive contrast filter can erase the middle of it.
+BLACK_LOCAL_CONTRAST = 10
+
+# Always keep pixels this dark even if local contrast is weak.
+BLACK_STRONG_THRESHOLD = 90
 
 # Ignore tiny noise at 320x180 detection resolution.
 MIN_LINE_AREA_BOTTOM = 90
@@ -156,7 +167,9 @@ LOOKAHEAD_ROI_TOP_RATIO = 0.42
 LOOKAHEAD_ROI_BOTTOM_RATIO = 0.68
 
 # Tolerance at DETECT_WIDTH=320.
-CENTER_TOLERANCE = 24
+# Wide center band prevents small angle changes from immediately pushing
+# the detected line outside the forward zone.
+CENTER_TOLERANCE = 72
 
 # How much lookahead affects steering.
 # Higher = reacts earlier to curves.
@@ -447,6 +460,9 @@ def create_black_mask(roi):
     # Small blur reduces noise but stays fast.
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
+    local_mean = cv2.GaussianBlur(gray, (31, 31), 0)
+    local_contrast = cv2.subtract(local_mean, gray)
+
     if USE_OTSU_THRESHOLD:
         _, mask = cv2.threshold(
             gray,
@@ -455,7 +471,13 @@ def create_black_mask(roi):
             cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
         )
     else:
-        mask = cv2.inRange(gray, 0, BLACK_THRESHOLD)
+        dark_mask = cv2.inRange(gray, 0, BLACK_THRESHOLD)
+        mask = dark_mask
+
+    contrast_mask = cv2.inRange(local_contrast, BLACK_LOCAL_CONTRAST, 255)
+    strong_dark_mask = cv2.inRange(gray, 0, BLACK_STRONG_THRESHOLD)
+    line_like_mask = cv2.bitwise_or(contrast_mask, strong_dark_mask)
+    mask = cv2.bitwise_and(mask, line_like_mask)
 
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -661,11 +683,11 @@ def choose_follow_command(detection):
     turn_speed = LINE_TURN_SPEED
 
     if abs_error > 90:
-        turn_speed = LINE_TURN_SPEED + 6
+        turn_speed = LINE_TURN_SPEED + 4
     elif abs_error > 55:
-        turn_speed = LINE_TURN_SPEED + 3
+        turn_speed = LINE_TURN_SPEED + 2
 
-    turn_speed = max(18, min(32, turn_speed))
+    turn_speed = max(18, min(24, turn_speed))
 
     if error < 0:
         last_follow_action = ("PIVOT LEFT", "Q", turn_speed)
@@ -737,7 +759,7 @@ def choose_recovery_command(detection):
 
 
 def decide_robot_action(detection):
-    global last_line_seen_at
+    global last_line_seen_at, last_follow_action
 
     now = time.time()
 
@@ -765,11 +787,17 @@ def decide_robot_action(detection):
         start_recovery()
         return "START RECOVERY", "S", 0
 
-    # Briefly keep the last follow action instead of hard-stopping, so a
-    # short detection dropout does not jerk the robot.
+    # Briefly keep moving only if the last command was forward. Repeating
+    # a pivot after the line disappears makes the robot rotate farther away
+    # from the line and enter recovery with a bigger error.
     if last_follow_action is not None:
         decision, command, speed = last_follow_action
-        return "LINE LOST COAST", command, speed
+
+        if command == "F":
+            return "LINE LOST COAST", command, speed
+
+        last_follow_action = None
+        return "LINE LOST WAIT", "S", 0
 
     return "LINE LOST WAIT", "S", 0
 
