@@ -1,0 +1,876 @@
+from flask import Flask, Response
+import cv2
+import numpy as np
+import serial
+import threading
+import time
+
+
+# ----------------------------
+# Robot / serial configuration
+# ----------------------------
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+
+# Servo angles
+SERVO_DEFAULT_ANGLE = 10
+SERVO_RIGHT_SCAN_ANGLE = 0
+SERVO_LEFT_SCAN_ANGLE = 20
+
+# Normal movement tuning
+ROBOT_SPEED = 16
+MIN_FOLLOW_SPEED = 13
+MAX_FOLLOW_SPEED = 20
+
+# Pivot/turn speed while following line
+LINE_TURN_SPEED = 24
+
+# Lost-line recovery turn speed
+RECOVERY_TURN_SPEED = 30
+
+# Send serial commands fast enough for live line following
+COMMAND_SEND_INTERVAL = 0.02
+SAME_COMMAND_INTERVAL = 0.05
+
+
+# ----------------------------
+# Lost-line recovery behavior
+# ----------------------------
+LOST_LINE_START_SECONDS = 0.18
+
+# Reasonable recovery turn duration.
+# Increase if it does not rotate enough.
+# Decrease if it rotates too much.
+RECOVERY_TURN_SECONDS = 0.42
+
+# Stop and let camera check.
+RECOVERY_CHECK_SECONDS = 1.20
+
+
+# ----------------------------
+# Camera configuration
+# ----------------------------
+CAMERA_INDEX = 0
+
+# Capture resolution:
+# 640x360 is a good balance:
+# - not too heavy like 640x480
+# - better than 320x240 for future QR/stream
+# - 16:9 camera view is usually cleaner
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 360
+CAMERA_FPS = 30
+
+# Detection resolution:
+# Line following does not need full 640.
+# This keeps latency low.
+DETECT_WIDTH = 320
+DETECT_HEIGHT = 180
+
+CAMERA_REOPEN_DELAY_SECONDS = 1.0
+CAMERA_UNAVAILABLE_LOG_INTERVAL = 5.0
+JPEG_QUALITY = 78
+
+
+# ----------------------------
+# Line detection configuration
+# ----------------------------
+
+# Use grayscale black detection, faster and usually cleaner than HSV for black line.
+# If your line is missed, increase this from 80 to 90/100.
+BLACK_THRESHOLD = 85
+
+# Ignore tiny noise at 320x180 detection resolution.
+MIN_LINE_AREA_BOTTOM = 90
+MIN_LINE_AREA_LOOKAHEAD = 60
+
+# Two ROI system:
+# Bottom ROI = current position
+# Lookahead ROI = upcoming curve
+BOTTOM_ROI_TOP_RATIO = 0.68
+BOTTOM_ROI_BOTTOM_RATIO = 0.98
+
+LOOKAHEAD_ROI_TOP_RATIO = 0.42
+LOOKAHEAD_ROI_BOTTOM_RATIO = 0.68
+
+# Tolerance at DETECT_WIDTH=320.
+CENTER_TOLERANCE = 24
+
+# How much lookahead affects steering.
+# Higher = reacts earlier to curves.
+LOOKAHEAD_WEIGHT = 0.65
+BOTTOM_WEIGHT = 1.00
+
+# Crop edges if robot body/wheels appear.
+CROP_LEFT_RATIO = 0.00
+CROP_RIGHT_RATIO = 1.00
+
+# Optional: if lighting is noisy, use Otsu threshold instead of fixed threshold.
+# Fixed threshold is faster and more predictable.
+USE_OTSU_THRESHOLD = False
+
+
+app = Flask(__name__)
+
+latest_frame = None
+latest_frame_seq = 0
+latest_frame_lock = threading.Lock()
+running = True
+
+
+class RobotSerial:
+    def __init__(self, port, baud_rate):
+        self.ser = None
+        self.last_payload = None
+        self.last_sent_at = 0.0
+        self.lock = threading.Lock()
+
+        try:
+            self.ser = serial.Serial(port, baud_rate, timeout=0.05)
+            time.sleep(2)
+            print(f"Connected to robot on {port}")
+
+            self.send_servo(SERVO_DEFAULT_ANGLE, force=True)
+            print(f"Servo default angle set to {SERVO_DEFAULT_ANGLE}")
+
+        except serial.SerialException as exc:
+            print(f"Serial not connected: {exc}")
+            print("Video server will run, but robot commands will not be sent.")
+
+    def send(self, command, speed=ROBOT_SPEED, force=False):
+        if command == "S":
+            payload = "S\n"
+        else:
+            payload = f"{command}{int(speed)}\n"
+
+        now = time.time()
+        min_interval = SAME_COMMAND_INTERVAL if payload == self.last_payload else COMMAND_SEND_INTERVAL
+
+        if not force and now - self.last_sent_at < min_interval:
+            return
+
+        if not self._write_payload(payload):
+            return
+
+        self.last_payload = payload
+        self.last_sent_at = now
+        print("Sent:", payload.strip())
+
+    def send_servo(self, angle, force=False):
+        angle = int(max(0, min(180, angle)))
+        self.send("A", angle, force=force)
+
+    def _write_payload(self, payload):
+        if not self.ser or not self.ser.is_open:
+            print(f"Serial not connected; could not send {payload.strip()}")
+            return False
+
+        try:
+            with self.lock:
+                self.ser.write(payload.encode("utf-8"))
+        except serial.SerialException as exc:
+            print(f"Serial write failed: {exc}")
+
+            try:
+                self.ser.close()
+            except serial.SerialException:
+                pass
+
+            self.ser = None
+            self.last_payload = None
+            return False
+
+        return True
+
+    def close(self):
+        self.send("S", force=True)
+
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except serial.SerialException as exc:
+                print(f"Serial close failed: {exc}")
+
+
+robot = RobotSerial(SERIAL_PORT, BAUD_RATE)
+
+
+# ----------------------------
+# Recovery state
+# ----------------------------
+last_line_seen_at = time.time()
+recovery_mode = False
+recovery_phase = "NORMAL"
+recovery_phase_started_at = 0.0
+servo_angle_now = SERVO_DEFAULT_ANGLE
+
+
+def set_recovery_phase(phase):
+    global recovery_phase, recovery_phase_started_at
+
+    recovery_phase = phase
+    recovery_phase_started_at = time.time()
+    print(f"Recovery phase: {phase}")
+
+
+def set_servo_angle(angle):
+    global servo_angle_now
+
+    if servo_angle_now != angle:
+        servo_angle_now = angle
+        robot.send_servo(angle, force=True)
+
+
+def start_recovery():
+    global recovery_mode
+
+    recovery_mode = True
+    set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
+    set_recovery_phase("TURN_RIGHT")
+
+
+def stop_recovery():
+    global recovery_mode
+
+    recovery_mode = False
+    set_servo_angle(SERVO_DEFAULT_ANGLE)
+    set_recovery_phase("NORMAL")
+
+
+# ----------------------------
+# Vision helpers
+# ----------------------------
+def create_black_mask(roi):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # Small blur reduces noise but stays fast.
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    if USE_OTSU_THRESHOLD:
+        _, mask = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+    else:
+        mask = cv2.inRange(gray, 0, BLACK_THRESHOLD)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    return mask
+
+
+def find_line_center_in_roi(frame_small, top_ratio, bottom_ratio, min_area):
+    h, w = frame_small.shape[:2]
+
+    crop_left = int(CROP_LEFT_RATIO * w)
+    crop_right = int(CROP_RIGHT_RATIO * w)
+
+    roi_top = int(top_ratio * h)
+    roi_bottom = int(bottom_ratio * h)
+
+    roi = frame_small[roi_top:roi_bottom, crop_left:crop_right]
+    mask = create_black_mask(roi)
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if not contours:
+        return {
+            "found": False,
+            "center_x": None,
+            "center_y": None,
+            "area": 0,
+            "roi_top": roi_top,
+            "roi_bottom": roi_bottom,
+            "crop_left": crop_left,
+            "crop_right": crop_right,
+            "mask": mask,
+        }
+
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+
+    if area < min_area:
+        return {
+            "found": False,
+            "center_x": None,
+            "center_y": None,
+            "area": area,
+            "roi_top": roi_top,
+            "roi_bottom": roi_bottom,
+            "crop_left": crop_left,
+            "crop_right": crop_right,
+            "mask": mask,
+        }
+
+    M = cv2.moments(largest)
+
+    if M["m00"] <= 0:
+        return {
+            "found": False,
+            "center_x": None,
+            "center_y": None,
+            "area": area,
+            "roi_top": roi_top,
+            "roi_bottom": roi_bottom,
+            "crop_left": crop_left,
+            "crop_right": crop_right,
+            "mask": mask,
+        }
+
+    local_center_x = int(M["m10"] / M["m00"])
+    local_center_y = int(M["m01"] / M["m00"])
+
+    return {
+        "found": True,
+        "center_x": crop_left + local_center_x,
+        "center_y": roi_top + local_center_y,
+        "area": area,
+        "roi_top": roi_top,
+        "roi_bottom": roi_bottom,
+        "crop_left": crop_left,
+        "crop_right": crop_right,
+        "mask": mask,
+    }
+
+
+def detect_line(frame):
+    # Resize only for detection.
+    # The stream still shows captured resolution.
+    frame_small = cv2.resize(
+        frame,
+        (DETECT_WIDTH, DETECT_HEIGHT),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    h, w = frame_small.shape[:2]
+
+    bottom = find_line_center_in_roi(
+        frame_small,
+        BOTTOM_ROI_TOP_RATIO,
+        BOTTOM_ROI_BOTTOM_RATIO,
+        MIN_LINE_AREA_BOTTOM,
+    )
+
+    lookahead = find_line_center_in_roi(
+        frame_small,
+        LOOKAHEAD_ROI_TOP_RATIO,
+        LOOKAHEAD_ROI_BOTTOM_RATIO,
+        MIN_LINE_AREA_LOOKAHEAD,
+    )
+
+    found_line = bottom["found"] or lookahead["found"]
+
+    bottom_error = 0
+    lookahead_error = 0
+
+    if bottom["found"]:
+        bottom_error = bottom["center_x"] - (w // 2)
+
+    if lookahead["found"]:
+        lookahead_error = lookahead["center_x"] - (w // 2)
+
+    # Combine current position and upcoming curve.
+    # Bottom is most important, lookahead helps early turn.
+    weighted_error = 0
+    total_weight = 0
+
+    if bottom["found"]:
+        weighted_error += bottom_error * BOTTOM_WEIGHT
+        total_weight += BOTTOM_WEIGHT
+
+    if lookahead["found"]:
+        weighted_error += lookahead_error * LOOKAHEAD_WEIGHT
+        total_weight += LOOKAHEAD_WEIGHT
+
+    if total_weight > 0:
+        weighted_error = weighted_error / total_weight
+
+    # Scale detection coordinates to full stream frame for drawing.
+    scale_x = FRAME_WIDTH / DETECT_WIDTH
+    scale_y = FRAME_HEIGHT / DETECT_HEIGHT
+
+    return {
+        "found_line": found_line,
+        "bottom": bottom,
+        "lookahead": lookahead,
+        "bottom_error": bottom_error,
+        "lookahead_error": lookahead_error,
+        "weighted_error": weighted_error,
+        "frame_small_width": w,
+        "frame_small_height": h,
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+    }
+
+
+# ----------------------------
+# Decision logic
+# ----------------------------
+def choose_follow_command(detection):
+    error = detection["weighted_error"]
+    abs_error = abs(error)
+
+    if abs_error <= CENTER_TOLERANCE:
+        decision = "FORWARD"
+        command = "F"
+
+        # Slow a little if lookahead says curve is coming.
+        curve_pressure = abs(detection["lookahead_error"])
+        if curve_pressure > CENTER_TOLERANCE * 2:
+            speed = MIN_FOLLOW_SPEED
+        else:
+            speed = ROBOT_SPEED
+
+        return decision, command, speed
+
+    # Dynamic turn speed based on how far line is from center.
+    # Stronger error = stronger pivot.
+    turn_speed = LINE_TURN_SPEED
+
+    if abs_error > 90:
+        turn_speed = LINE_TURN_SPEED + 6
+    elif abs_error > 55:
+        turn_speed = LINE_TURN_SPEED + 3
+
+    turn_speed = max(18, min(32, turn_speed))
+
+    if error < 0:
+        return "PIVOT LEFT", "Q", turn_speed
+
+    return "PIVOT RIGHT", "E", turn_speed
+
+
+def choose_recovery_command(detection):
+    global last_line_seen_at
+
+    now = time.time()
+    elapsed = now - recovery_phase_started_at
+
+    # Found line during recovery.
+    if detection["found_line"]:
+        last_line_seen_at = now
+        stop_recovery()
+        return choose_follow_command(detection)
+
+    if recovery_phase == "TURN_RIGHT":
+        if elapsed < RECOVERY_TURN_SECONDS:
+            return "RECOVERY TURN RIGHT", "E", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_RIGHT")
+        return "RECOVERY CHECK RIGHT", "S", 0
+
+    if recovery_phase == "CHECK_RIGHT":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK RIGHT", "S", 0
+
+        set_servo_angle(SERVO_DEFAULT_ANGLE)
+        time.sleep(0.08)
+
+        set_servo_angle(SERVO_LEFT_SCAN_ANGLE)
+        set_recovery_phase("TURN_LEFT")
+        return "RECOVERY PREP LEFT", "S", 0
+
+    if recovery_phase == "TURN_LEFT":
+        if elapsed < RECOVERY_TURN_SECONDS:
+            return "RECOVERY TURN LEFT", "Q", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_LEFT")
+        return "RECOVERY CHECK LEFT", "S", 0
+
+    if recovery_phase == "CHECK_LEFT":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK LEFT", "S", 0
+
+        set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
+        set_recovery_phase("TURN_RIGHT")
+        return "RECOVERY RESTART", "S", 0
+
+    set_recovery_phase("TURN_RIGHT")
+    return "RECOVERY RESET", "S", 0
+
+
+def decide_robot_action(detection):
+    global last_line_seen_at
+
+    now = time.time()
+
+    if recovery_mode:
+        return choose_recovery_command(detection)
+
+    if detection["found_line"]:
+        last_line_seen_at = now
+
+        if servo_angle_now != SERVO_DEFAULT_ANGLE:
+            set_servo_angle(SERVO_DEFAULT_ANGLE)
+
+        return choose_follow_command(detection)
+
+    time_since_line_seen = now - last_line_seen_at
+
+    if time_since_line_seen >= LOST_LINE_START_SECONDS:
+        start_recovery()
+        return "START RECOVERY", "S", 0
+
+    return "LINE LOST WAIT", "S", 0
+
+
+# ----------------------------
+# Debug drawing
+# ----------------------------
+def draw_roi_box(frame, roi_info, scale_x, scale_y, color, label):
+    x1 = int(roi_info["crop_left"] * scale_x)
+    x2 = int(roi_info["crop_right"] * scale_x)
+    y1 = int(roi_info["roi_top"] * scale_y)
+    y2 = int(roi_info["roi_bottom"] * scale_y)
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    cv2.putText(
+        frame,
+        label,
+        (x1 + 8, y1 + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+    )
+
+    if roi_info["found"]:
+        cx = int(roi_info["center_x"] * scale_x)
+        cy = int(roi_info["center_y"] * scale_y)
+
+        cv2.circle(frame, (cx, cy), 8, color, -1)
+
+
+def draw_debug(frame, detection, decision, command, speed):
+    h, w = frame.shape[:2]
+
+    scale_x = detection["scale_x"]
+    scale_y = detection["scale_y"]
+
+    if detection["found_line"]:
+        color = (0, 255, 0)
+    elif recovery_mode:
+        color = (0, 255, 255)
+    else:
+        color = (0, 0, 255)
+
+    # Draw center/tolerance lines based on stream size.
+    center_x = w // 2
+    tolerance_full = int(CENTER_TOLERANCE * scale_x)
+
+    cv2.line(frame, (center_x, 0), (center_x, h), (255, 255, 0), 2)
+    cv2.line(frame, (center_x - tolerance_full, 0), (center_x - tolerance_full, h), (120, 120, 0), 1)
+    cv2.line(frame, (center_x + tolerance_full, 0), (center_x + tolerance_full, h), (120, 120, 0), 1)
+
+    draw_roi_box(
+        frame,
+        detection["lookahead"],
+        scale_x,
+        scale_y,
+        (255, 0, 255),
+        "LOOKAHEAD",
+    )
+
+    draw_roi_box(
+        frame,
+        detection["bottom"],
+        scale_x,
+        scale_y,
+        (0, 255, 0),
+        "BOTTOM",
+    )
+
+    cv2.putText(
+        frame,
+        f"{decision} | CMD {command} | SPD {int(speed)}",
+        (10, 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.70,
+        color,
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"ERR W:{int(detection['weighted_error'])} B:{int(detection['bottom_error'])} L:{int(detection['lookahead_error'])}",
+        (10, 64),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 0),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"AREA B:{int(detection['bottom']['area'])} L:{int(detection['lookahead']['area'])} | SERVO {servo_angle_now}",
+        (10, 94),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 0),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"MODE {'RECOVERY' if recovery_mode else 'FOLLOW'} | PHASE {recovery_phase} | DETECT {DETECT_WIDTH}x{DETECT_HEIGHT}",
+        (10, 124),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.54,
+        (255, 255, 255),
+        2,
+    )
+
+
+# ----------------------------
+# Frame publishing
+# ----------------------------
+def publish_frame(frame):
+    global latest_frame, latest_frame_seq
+
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+    )
+
+    if ok:
+        with latest_frame_lock:
+            latest_frame = buffer.tobytes()
+            latest_frame_seq += 1
+
+
+def publish_status_frame(message):
+    frame = np.zeros((240, 560, 3), dtype=np.uint8)
+
+    cv2.putText(
+        frame,
+        message,
+        (18, 112),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+    )
+
+    publish_frame(frame)
+
+
+# ----------------------------
+# Camera
+# ----------------------------
+def open_camera():
+    # V4L2 often gives lower latency on Raspberry Pi/Linux.
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+
+    # Ask camera for MJPG to reduce USB bandwidth/CPU pressure.
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+
+    # Important: reduce old-frame buffering.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        cap.release()
+        return None
+
+    # Throw away a few startup frames.
+    for _ in range(3):
+        cap.read()
+
+    ok, frame = cap.read()
+
+    if ok and frame is not None:
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"Using camera index {CAMERA_INDEX}: {actual_w}x{actual_h} @ {actual_fps:.1f} FPS")
+        return cap
+
+    print(f"Camera index {CAMERA_INDEX} opened but did not return frames.")
+    cap.release()
+    return None
+
+
+def camera_control_loop():
+    global running
+
+    cap = None
+    camera_read_failed = False
+    last_camera_unavailable_log_at = 0.0
+
+    publish_status_frame("Starting camera...")
+
+    try:
+        while running:
+            loop_started_at = time.time()
+
+            if cap is None:
+                cap = open_camera()
+
+                if cap is None:
+                    now = time.time()
+
+                    if now - last_camera_unavailable_log_at >= CAMERA_UNAVAILABLE_LOG_INTERVAL:
+                        print("Camera unavailable; robot stopped and retrying.")
+                        robot.send("S", force=True)
+                        publish_status_frame("Camera unavailable")
+                        last_camera_unavailable_log_at = now
+
+                    time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
+                    continue
+
+            # Grab/retrieve helps keep latest frame fresher on some cameras.
+            ok = cap.grab()
+            if not ok:
+                frame = None
+            else:
+                ok, frame = cap.retrieve()
+
+            if not ok or frame is None:
+                if not camera_read_failed:
+                    print("Camera read failed; stopping robot until frames return.")
+                    robot.send("S", force=True)
+                    publish_status_frame("Camera read failed")
+                    camera_read_failed = True
+
+                cap.release()
+                cap = None
+                time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
+                continue
+
+            if camera_read_failed:
+                print("Camera frames returned.")
+                camera_read_failed = False
+
+            # Some cameras ignore requested resolution, so resize stream frame for consistency.
+            if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+
+            detection = detect_line(frame)
+            decision, command, speed = decide_robot_action(detection)
+
+            robot.send(command, speed)
+
+            draw_debug(frame, detection, decision, command, speed)
+
+            elapsed_ms = (time.time() - loop_started_at) * 1000.0
+            cv2.putText(
+                frame,
+                f"LOOP {elapsed_ms:.1f}ms",
+                (10, FRAME_HEIGHT - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+
+            publish_frame(frame)
+
+    finally:
+        robot.close()
+
+        if cap is not None:
+            cap.release()
+
+
+def generate_frames():
+    sent_frame_seq = -1
+
+    while running:
+        with latest_frame_lock:
+            frame = latest_frame
+            frame_seq = latest_frame_seq
+
+        if frame is None or frame_seq == sent_frame_seq:
+            time.sleep(0.005)
+            continue
+
+        sent_frame_seq = frame_seq
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        )
+
+
+@app.route("/")
+def index():
+    return """
+<!doctype html>
+<html>
+<head>
+    <title>Robot Line Detection</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            color: white;
+            font-family: Arial, sans-serif;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 22px;
+            margin: 16px 0;
+        }
+
+        img {
+            width: 100%;
+            max-width: 720px;
+            height: auto;
+            border: 2px solid #333;
+            background: black;
+        }
+
+        .hint {
+            color: #bbb;
+            font-size: 14px;
+            margin: 10px auto 18px;
+            max-width: 760px;
+            padding: 0 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Robot Line Detection</h1>
+    <div class="hint">
+        Capture 640x360, detect 320x180. Two ROI line tracking: lookahead + bottom.
+    </div>
+    <img src="/video_feed" alt="Robot camera stream">
+</body>
+</html>
+"""
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        generate_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+if __name__ == "__main__":
+    worker = threading.Thread(target=camera_control_loop, daemon=True)
+    worker.start()
+
+    try:
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    finally:
+        running = False
+        robot.close()
