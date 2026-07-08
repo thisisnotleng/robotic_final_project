@@ -1105,6 +1105,7 @@ def overpass_command(detection):
 
 def choose_obstacle_command(detection, frame):
     global last_line_seen_at
+    global obstacle_align_label, obstacle_align_conf, obstacle_align_error
 
     now = time.time()
     elapsed = now - obstacle_phase_started_at
@@ -1141,8 +1142,48 @@ def choose_obstacle_command(detection, frame):
 
             return "OBSTACLE LOOKING BOX", "S", 0
 
+        alignment = get_best_box_alignment(frame)
+
+        obstacle_align_label = label
+        obstacle_align_conf = conf
+        obstacle_align_error = int(alignment["error"]) if alignment is not None else 0
+
+        if (
+            OBSTACLE_ALIGN_ENABLED
+            and alignment is not None
+            and abs(obstacle_align_error) > OBSTACLE_ALIGN_TOLERANCE_PX
+        ):
+            set_obstacle_phase("ALIGN_BOX")
+            return f"ALIGN BOX START {obstacle_align_error:+d}", "S", 0
+
         overpass_begin(label, conf)
         return f"{label.upper()} TUNABLE OVERPASS START", "S", 0
+
+    if obstacle_phase == "ALIGN_BOX":
+        set_servo_angle(SERVO_OBSTACLE_ANGLE)
+        label, conf = detect_obstacle_box(frame)
+        alignment = get_best_box_alignment(frame)
+
+        if alignment is not None:
+            obstacle_align_label = label
+            obstacle_align_conf = conf
+            obstacle_align_error = int(alignment["error"])
+
+        should_start_overpass = (
+            alignment is not None
+            and abs(obstacle_align_error) <= OBSTACLE_ALIGN_TOLERANCE_PX
+        )
+        timed_out = elapsed >= OBSTACLE_ALIGN_TIMEOUT_SECONDS
+
+        if should_start_overpass or timed_out:
+            robot.send("S", force=True)
+            overpass_begin(obstacle_align_label or label, obstacle_align_conf or conf)
+            return "BOX ALIGNED OVERPASS START", "S", 0
+
+        if obstacle_align_error < 0:
+            return f"ALIGN BOX LEFT {obstacle_align_error:+d}", "Q", OBSTACLE_ALIGN_SPEED
+
+        return f"ALIGN BOX RIGHT {obstacle_align_error:+d}", "E", OBSTACLE_ALIGN_SPEED
 
     if obstacle_phase == "OVERPASS_RUN":
         set_servo_angle(SERVO_DEFAULT_ANGLE)
