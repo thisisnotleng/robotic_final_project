@@ -1,596 +1,1570 @@
-#include <Arduino.h>
-#include <ESP32Servo.h>
+from flask import Flask, Response
+import cv2
+import numpy as np
+import os
+import serial
+import threading
+import time
 
-#define DEFAULT_SPEED 25
-#define COMMAND_TIMEOUT_MS 1200
-#define SERIAL_DEBUG false
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
-// -------------------- Smooth movement tuning --------------------
 
-#define CONTROL_INTERVAL_MS 20
+# ----------------------------
+# Robot / serial configuration
+# ----------------------------
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
 
-// How fast motor target changes.
-// Smaller = smoother but slower response.
-// Bigger = faster but more jerky. 
-#define RAMP_STEP_UP 4
-#define RAMP_STEP_DOWN 8
+# Servo angles
+SERVO_DEFAULT_ANGLE = 0
+SERVO_OBSTACLE_ANGLE = 15
 
-// Keep serial speeds literal for control logic, but lift nonzero PWM
-// above motor stall torque so all wheels actually start moving.
-#define MIN_ACTIVE_SPEED 1
-#define MIN_ACTIVE_PWM 55
+SERVO_RIGHT_SCAN_ANGLE = SERVO_DEFAULT_ANGLE
+SERVO_LEFT_SCAN_ANGLE = SERVO_DEFAULT_ANGLE
 
-// Python already chooses safe line-following speeds.
-#define MAX_DRIVE_SPEED 100
+# Normal movement tuning
+ROBOT_SPEED = 8
+MIN_FOLLOW_SPEED = 5
+MAX_FOLLOW_SPEED = 25
 
-// Python also chooses pivot/search speeds.
-#define MAX_PIVOT_SPEED 100
+# Stronger turn speed for curves.
+LINE_TURN_SPEED = 19
 
-// Arc turning.
-// Inner wheels stop, outer wheels move forward.
+# Recovery turn must not be weak.
+RECOVERY_TURN_SPEED = 20
 
-// Pivot turning.
-// Inner wheels stop, outer wheels move forward.
-// This keeps rotation from dragging the opposite side backward.
-#define PIVOT_PERCENT 100
+COMMAND_SEND_INTERVAL = 0.02
+SAME_COMMAND_INTERVAL = 0.05
 
-// -------------------- Servo and ultrasonic pins --------------------
 
-// Matches the basic working servo test sketch.
-#define SERVO_PIN 17
+# ----------------------------
+# Lost-line recovery behavior
+# ----------------------------
+LOST_LINE_START_SECONDS = 0.12
 
-// Your earlier ultrasonic setup.
-#define ULTRASONIC_TRIG 13
-#define ULTRASONIC_ECHO 39
+RECOVERY_SEARCH_TURN_SECONDS = 1.15
+RECOVERY_RETURN_TURN_SECONDS = 1.08
+RECOVERY_CHECK_SECONDS = 0.20
+RECOVERY_REPEAT_SCAN = True
 
-// Automatic distance reporting.
-// One short sample per interval keeps loop() responsive, and the
-// Python side receives "DIST:<cm>" lines without having to ask.
-#define ULTRASONIC_INTERVAL_MS 60
 
-// Echo timeout ~1m max range. A short timeout keeps each sample fast
-// (max ~6ms) so motor ramping stays smooth.
-#define ULTRASONIC_TIMEOUT_US 6000
+# ----------------------------
+# Smoothness tuning
+# ----------------------------
+ERROR_SMOOTHING_ALPHA = 0.8
+TURN_RELEASE_RATIO = 0.7
+RECOVERY_EXIT_FOUND_FRAMES = 3
+SERVO_MOVE_MIN_INTERVAL = 0.5
+CENTER_OFFSET_PX = 0
 
-#define SERVO_MIN_ANGLE 0
-#define SERVO_MAX_ANGLE 180
 
-// Camera looks down at the line by default.
-// Python lifts it to 10 when the ultrasonic sees an obstacle.
-#define SERVO_DEFAULT_ANGLE 5
+# ----------------------------
+# Obstacle detection
+# ----------------------------
+OBSTACLE_STOP_CM = 40.0
+OBSTACLE_CLEAR_EXIT_CM = 55.0
 
-Servo cameraServo;
+OBSTACLE_CONFIRM_READINGS = 2
+ULTRASONIC_STALE_SECONDS = 1.0
 
-// -------------------- Motor pins --------------------
+OBSTACLE_SCAN_BOX_TIMEOUT_SECONDS = 1.20
 
-// Front Left motor
-#define FL_PWM 14
-#define FL_IN1 32
-#define FL_IN2 27
-#define FL_CH 8
-#define FL_FORWARD true
+YOLO_MODEL_PATHS = [
+    os.path.join(os.path.dirname(__file__), "best.onnx"),
+    os.path.join(os.getcwd(), "best.onnx"),
+]
+BOX_CONFIDENCE_THRESHOLD = 0.45
+OBSTACLE_SERVO_SETTLE_SECONDS = 0.45
 
-// Front Right motor
-#define FR_PWM 19
-#define FR_IN1 23
-#define FR_IN2 22
-#define FR_CH 9
-#define FR_FORWARD true
 
-// Rear Left motor
-#define RL_PWM 33
-#define RL_IN1 26
-#define RL_IN2 25
-#define RL_CH 10
-#define RL_FORWARD false
+# ============================================================
+# SEPARATE TUNABLE OBSTACLE OVERPASS CONTROLLER
+# ============================================================
+# This section is completely separate from normal line following.
+#
+# It does NOT use:
+# - ROBOT_SPEED
+# - LINE_TURN_SPEED
+# - RECOVERY_TURN_SPEED
+#
+# Green box = overpass LEFT.
+# Red box   = overpass RIGHT.
+#
+# Each step:
+# {
+#     "name": debug name,
+#     "command": "F" / "Q" / "E" / "S",
+#     "speed": speed value,
+#     "seconds": duration,
+#     "check_line": True/False,
+# }
+#
+# IMPORTANT:
+# - check_line False = ignore line detection during escape/bypass.
+# - check_line True  = robot starts looking for line again.
+# ============================================================
 
-// Rear Right motor
-#define RR_PWM 5
-#define RR_IN1 21
-#define RR_IN2 18
-#define RR_CH 11
-#define RR_FORWARD true
+OVERPASS_BRAKE_SECONDS = 0.08
+OVERPASS_EXIT_FOUND_FRAMES = 2
+OVERPASS_BACK_IN_TOTAL_TIMEOUT_SECONDS = 5.00
 
-struct Motor {
-  const char* name;
-  int pwm;
-  int in1;
-  int in2;
-  int channel;
-  bool forwardDirection;
-};
+# Green box = move out LEFT, then come back RIGHT.
+LEFT_OVERPASS_STEPS = [
+    {
+        "name": "LEFT: rotate out left",
+        "command": "Q",
+        "speed": 30,
+        "seconds": 0.6,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: forward out from line",
+        "command": "F",
+        "speed": 16,
+        "seconds": 1.0,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: rotate right to parallel",
+        "command": "E",
+        "speed": 21,
+        "seconds": 0.7,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: forward beside obstacle",
+        "command": "F",
+        "speed": 17,
+        "seconds": 1.6,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: turn right back to line",
+        "command": "E",
+        "speed": 18,
+        "seconds": 0.16,
+        "check_line": True,
+    },
+    {
+        "name": "LEFT: forward search line",
+        "command": "F",
+        "speed": 13,
+        "seconds": 0.18,
+        "check_line": True,
+    },
+]
 
-Motor motors[] = {
-  {"Front Left",  FL_PWM, FL_IN1, FL_IN2, FL_CH, FL_FORWARD},
-  {"Front Right", FR_PWM, FR_IN1, FR_IN2, FR_CH, FR_FORWARD},
-  {"Rear Left",   RL_PWM, RL_IN1, RL_IN2, RL_CH, RL_FORWARD},
-  {"Rear Right",  RR_PWM, RR_IN1, RR_IN2, RR_CH, RR_FORWARD}
-};
+# Red box = move out RIGHT, then come back LEFT.
+# Right turn uses stronger speed because your robot's right turn is weaker.
+RIGHT_OVERPASS_STEPS = [
+    {
+        "name": "RIGHT: rotate out right",
+        "command": "E",
+        "speed": 30,
+        "seconds": 0.5,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: forward out from line",
+        "command": "F",
+        "speed": 20,
+        "seconds": 0.7,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: rotate left to parallel",
+        "command": "Q",
+        "speed": 30,
+        "seconds": 0.4,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: forward beside obstacle",
+        "command": "F",
+        "speed": 17,
+        "seconds": 1.25,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: turn left back to line",
+        "command": "Q",
+        "speed": 22,
+        "seconds": 0.16,
+        "check_line": True,
+    },
+    {
+        "name": "RIGHT: forward search line",
+        "command": "F",
+        "speed": 13,
+        "seconds": 0.18,
+        "check_line": True,
+    },
+]
 
-const int motorCount = sizeof(motors) / sizeof(motors[0]);
 
-// Motor speed range:
-// positive = forward
-// negative = backward
-// zero = stop
-int targetSpeed[4] = {0, 0, 0, 0};
-int currentMotorSpeed[4] = {0, 0, 0, 0};
+# ----------------------------
+# Camera configuration
+# ----------------------------
+CAMERA_INDEX = 0
 
-int currentSpeed = DEFAULT_SPEED;
-unsigned long lastCommandAt = 0;
-unsigned long lastControlUpdate = 0;
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+CAMERA_FPS = 30
 
-// Rolling ultrasonic samples for a simple median filter.
-unsigned long lastUltrasonicAt = 0;
-float distanceSamples[3] = {-1, -1, -1};
-int distanceSampleIndex = 0;
-float lastMedianDistanceCm = -1;
+DETECT_WIDTH = 320
+DETECT_HEIGHT = 240
 
-// -------------------- Function declarations --------------------
+CAMERA_REOPEN_DELAY_SECONDS = 1.0
+CAMERA_UNAVAILABLE_LOG_INTERVAL = 5.0
+JPEG_QUALITY = 78
 
-void setupMotorPins();
-void setupServoAndUltrasonic();
 
-void handleSerialCommands();
-void handleCommand(String command);
+# ----------------------------
+# Line detection configuration
+# ----------------------------
+BLACK_THRESHOLD = 135
+BLACK_LOCAL_CONTRAST = 10
+BLACK_STRONG_THRESHOLD = 90
 
-void setTargetMotor(int index, int signedSpeed);
-void setTargetAll(int fl, int fr, int rl, int rr);
+MIN_LINE_AREA_BOTTOM = 70
+MIN_LINE_AREA_LOOKAHEAD = 45
 
-void updateSmoothMotors();
-int rampToward(int current, int target);
-void applyMotorSpeed(int index, int signedSpeed);
-void stopMotorImmediate(int index);
+BOTTOM_ROI_TOP_RATIO = 0.70
+BOTTOM_ROI_BOTTOM_RATIO = 0.98
 
-void forward(int speed);
-void backward(int speed);
-void turnLeft(int speed);
-void turnRight(int speed);
-void pivotLeft(int speed);
-void pivotRight(int speed);
+LOOKAHEAD_ROI_TOP_RATIO = 0.45
+LOOKAHEAD_ROI_BOTTOM_RATIO = 0.70
 
-void smoothStop();
-void emergencyStop();
+CENTER_TOLERANCE = 50
 
-int cleanSpeed(int speed, int maxSpeed);
-int scaledSpeed(int speed, int percent);
-int speedToPwm(int speed);
+LOOKAHEAD_WEIGHT = 1.35
+BOTTOM_WEIGHT = 1.00
 
-void setServoAngle(int angle);
-void updateUltrasonic();
-float medianDistanceCm();
-float readUltrasonicSampleCm();
+CROP_LEFT_RATIO = 0.00
+CROP_RIGHT_RATIO = 1.00
 
-void printDebug(const char* message);
+USE_OTSU_THRESHOLD = False
 
-// -------------------- Setup and loop --------------------
 
-void setup() {
-  Serial.begin(115200);
-  Serial.setTimeout(20);
+app = Flask(__name__)
 
-  setupMotorPins();
-  setupServoAndUltrasonic();
+latest_frame = None
+latest_frame_seq = 0
+latest_frame_lock = threading.Lock()
+running = True
 
-  emergencyStop();
 
-  Serial.println("Smooth serial motor controller ready");
-  Serial.println("Commands: F30 B30 L30 R30 Q30 E30 S X A90 U");
-}
+class RobotSerial:
+    def __init__(self, port, baud_rate):
+        self.ser = None
+        self.last_payload = None
+        self.last_sent_at = 0.0
+        self.lock = threading.Lock()
 
-void loop() {
-  handleSerialCommands();
+        self.rx_buffer = ""
+        self.last_distance_cm = None
+        self.last_distance_at = 0.0
 
-  if (lastCommandAt > 0 && millis() - lastCommandAt > COMMAND_TIMEOUT_MS) {
-    smoothStop();
-  }
+        try:
+            self.ser = serial.Serial(port, baud_rate, timeout=0.05)
+            time.sleep(2)
+            print(f"Connected to robot on {port}")
 
-  updateSmoothMotors();
-  updateUltrasonic();
-}
+            self.send_servo(SERVO_DEFAULT_ANGLE, force=True)
+            print(f"Servo default angle set to {SERVO_DEFAULT_ANGLE}")
 
-// -------------------- Setup helpers --------------------
+        except serial.SerialException as exc:
+            print(f"Serial not connected: {exc}")
+            print("Video server will run, but robot commands will not be sent.")
 
-void setupMotorPins() {
-  for (int i = 0; i < motorCount; i++) {
-    pinMode(motors[i].in1, OUTPUT);
-    pinMode(motors[i].in2, OUTPUT);
+    def send(self, command, speed=ROBOT_SPEED, force=False):
+        if command == "S":
+            payload = "S\n"
+        else:
+            payload = f"{command}{int(speed)}\n"
 
-    ledcSetup(motors[i].channel, 20000, 8);
-    ledcAttachPin(motors[i].pwm, motors[i].channel);
-  }
-}
+        now = time.time()
+        min_interval = SAME_COMMAND_INTERVAL if payload == self.last_payload else COMMAND_SEND_INTERVAL
 
-void setupServoAndUltrasonic() {
-  pinMode(ULTRASONIC_TRIG, OUTPUT);
-  pinMode(ULTRASONIC_ECHO, INPUT);
+        if not force and now - self.last_sent_at < min_interval:
+            return
 
-  cameraServo.setPeriodHertz(50);
-  cameraServo.attach(SERVO_PIN);
-  cameraServo.write(SERVO_DEFAULT_ANGLE);
-}
+        if not self._write_payload(payload):
+            return
 
-// -------------------- Serial command handling --------------------
+        self.last_payload = payload
+        self.last_sent_at = now
+        print("Sent:", payload.strip())
 
-void handleSerialCommands() {
-  while (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
+    def send_servo(self, angle, force=False):
+        angle = int(max(0, min(180, angle)))
+        self.send("A", angle, force=force)
 
-    if (command.length() > 0) {
-      handleCommand(command);
+    def poll_responses(self):
+        if not self.ser or not self.ser.is_open:
+            return
+
+        try:
+            with self.lock:
+                waiting = self.ser.in_waiting
+                data = self.ser.read(waiting) if waiting > 0 else b""
+        except (serial.SerialException, OSError) as exc:
+            print(f"Serial read failed: {exc}")
+            return
+
+        if not data:
+            return
+
+        self.rx_buffer += data.decode("utf-8", errors="ignore")
+
+        while "\n" in self.rx_buffer:
+            line, self.rx_buffer = self.rx_buffer.split("\n", 1)
+            line = line.strip()
+
+            if line.startswith("DIST:"):
+                try:
+                    self.last_distance_cm = float(line[5:])
+                    self.last_distance_at = time.time()
+                except ValueError:
+                    pass
+
+    def get_distance(self):
+        if self.last_distance_cm is None:
+            return None, 0.0
+
+        if time.time() - self.last_distance_at > ULTRASONIC_STALE_SECONDS:
+            return None, 0.0
+
+        return self.last_distance_cm, self.last_distance_at
+
+    def _write_payload(self, payload):
+        if not self.ser or not self.ser.is_open:
+            print(f"Serial not connected; could not send {payload.strip()}")
+            return False
+
+        try:
+            with self.lock:
+                self.ser.write(payload.encode("utf-8"))
+        except serial.SerialException as exc:
+            print(f"Serial write failed: {exc}")
+
+            try:
+                self.ser.close()
+            except serial.SerialException:
+                pass
+
+            self.ser = None
+            self.last_payload = None
+            return False
+
+        return True
+
+    def close(self):
+        self.send("S", force=True)
+
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except serial.SerialException as exc:
+                print(f"Serial close failed: {exc}")
+
+
+robot = RobotSerial(SERIAL_PORT, BAUD_RATE)
+
+box_model = None
+box_model_path = next((path for path in YOLO_MODEL_PATHS if os.path.exists(path)), None)
+
+if YOLO is None:
+    print("ultralytics is not installed; obstacle box classification is disabled.")
+elif box_model_path is None:
+    print(f"YOLO model not found at {YOLO_MODEL_PATHS}; obstacle box classification is disabled.")
+else:
+    try:
+        box_model = YOLO(box_model_path)
+        print(f"Loaded YOLO model: {box_model_path}")
+    except Exception as exc:
+        print(f"Could not load YOLO model {box_model_path}: {exc}")
+
+
+# ----------------------------
+# State
+# ----------------------------
+last_line_seen_at = time.time()
+recovery_mode = False
+recovery_phase = "NORMAL"
+recovery_phase_started_at = 0.0
+servo_angle_now = SERVO_DEFAULT_ANGLE
+servo_last_moved_at = 0.0
+recovery_found_streak = 0
+smoothed_error = 0.0
+last_follow_action = None
+
+# Obstacle state
+obstacle_mode = False
+obstacle_phase = "CLEAR"
+obstacle_phase_started_at = 0.0
+obstacle_below_count = 0
+obstacle_last_reading_at = 0.0
+obstacle_box_label = None
+obstacle_box_conf = 0.0
+obstacle_overpass_side = None
+overpass_found_line_streak = 0
+latest_box_detections = []
+
+# Tunable overpass internal state
+overpass_brake_until = 0.0
+overpass_back_in_started_at = 0.0
+overpass_steps = []
+overpass_step_index = 0
+
+
+def set_recovery_phase(phase):
+    global recovery_phase, recovery_phase_started_at
+    recovery_phase = phase
+    recovery_phase_started_at = time.time()
+    print(f"Recovery phase: {phase}")
+
+
+def set_servo_angle(angle, force=False):
+    global servo_angle_now, servo_last_moved_at
+
+    if servo_angle_now == angle and not force:
+        return
+
+    now = time.time()
+    if not force and now - servo_last_moved_at < SERVO_MOVE_MIN_INTERVAL:
+        return
+
+    servo_angle_now = angle
+    servo_last_moved_at = now
+    robot.send_servo(angle, force=True)
+
+
+def set_obstacle_phase(phase):
+    global obstacle_phase, obstacle_phase_started_at
+    global overpass_brake_until
+
+    obstacle_phase = phase
+    obstacle_phase_started_at = time.time()
+
+    if phase == "OVERPASS_RUN":
+        overpass_brake_until = time.time() + OVERPASS_BRAKE_SECONDS
+    else:
+        overpass_brake_until = 0.0
+
+    print(f"Obstacle phase: {phase}")
+
+
+def start_recovery():
+    global recovery_mode, recovery_found_streak, last_follow_action
+
+    recovery_mode = True
+    recovery_found_streak = 0
+    last_follow_action = None
+
+    robot.send("S", force=True)
+    set_servo_angle(SERVO_DEFAULT_ANGLE)
+    set_recovery_phase("SEARCH_LEFT")
+
+
+def stop_recovery():
+    global recovery_mode, recovery_found_streak, smoothed_error
+
+    recovery_mode = False
+    recovery_found_streak = 0
+    smoothed_error = 0.0
+    set_servo_angle(SERVO_DEFAULT_ANGLE)
+    set_recovery_phase("NORMAL")
+
+
+# ----------------------------
+# Obstacle handling
+# ----------------------------
+def enter_obstacle_mode():
+    global obstacle_mode, recovery_mode, last_follow_action
+    global obstacle_box_label, obstacle_box_conf, obstacle_overpass_side
+    global overpass_found_line_streak, latest_box_detections
+    global overpass_brake_until, overpass_back_in_started_at
+    global overpass_steps, overpass_step_index
+
+    obstacle_mode = True
+    last_follow_action = None
+    obstacle_box_label = None
+    obstacle_box_conf = 0.0
+    obstacle_overpass_side = None
+    overpass_found_line_streak = 0
+    latest_box_detections = []
+
+    overpass_brake_until = 0.0
+    overpass_back_in_started_at = 0.0
+    overpass_steps = []
+    overpass_step_index = 0
+
+    if recovery_mode:
+        recovery_mode = False
+        set_recovery_phase("NORMAL")
+
+    robot.send("S", force=True)
+    set_servo_angle(SERVO_OBSTACLE_ANGLE, force=True)
+    set_obstacle_phase("SCAN_SETTLE")
+    print("Obstacle detected: robot stopped, servo moved for box scan.")
+
+
+def exit_obstacle_mode():
+    global obstacle_mode, obstacle_below_count, last_line_seen_at
+    global obstacle_box_label, obstacle_box_conf, obstacle_overpass_side
+    global overpass_found_line_streak, latest_box_detections
+    global overpass_brake_until, overpass_back_in_started_at
+    global overpass_steps, overpass_step_index
+    global smoothed_error, last_follow_action
+
+    obstacle_mode = False
+    obstacle_below_count = 0
+    obstacle_box_label = None
+    obstacle_box_conf = 0.0
+    obstacle_overpass_side = None
+    overpass_found_line_streak = 0
+    latest_box_detections = []
+
+    overpass_brake_until = 0.0
+    overpass_back_in_started_at = 0.0
+    overpass_steps = []
+    overpass_step_index = 0
+
+    smoothed_error = 0.0
+    last_follow_action = None
+
+    set_obstacle_phase("CLEAR")
+    set_servo_angle(SERVO_DEFAULT_ANGLE, force=True)
+
+    last_line_seen_at = time.time()
+    print("Obstacle handling complete: resuming line following.")
+
+
+def update_obstacle_state():
+    global obstacle_below_count, obstacle_last_reading_at
+
+    distance, measured_at = robot.get_distance()
+
+    if distance is None or measured_at <= obstacle_last_reading_at:
+        return
+
+    obstacle_last_reading_at = measured_at
+
+    blocked = 0 < distance <= OBSTACLE_STOP_CM
+
+    if not obstacle_mode:
+        if blocked:
+            obstacle_below_count += 1
+
+            if obstacle_below_count >= OBSTACLE_CONFIRM_READINGS:
+                enter_obstacle_mode()
+        else:
+            obstacle_below_count = 0
+
+        return
+
+
+# ----------------------------
+# Vision helpers
+# ----------------------------
+def create_black_mask(roi):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    local_mean = cv2.GaussianBlur(gray, (31, 31), 0)
+    local_contrast = cv2.subtract(local_mean, gray)
+
+    if USE_OTSU_THRESHOLD:
+        _, mask = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+    else:
+        dark_mask = cv2.inRange(gray, 0, BLACK_THRESHOLD)
+        mask = dark_mask
+
+    contrast_mask = cv2.inRange(local_contrast, BLACK_LOCAL_CONTRAST, 255)
+    strong_dark_mask = cv2.inRange(gray, 0, BLACK_STRONG_THRESHOLD)
+    line_like_mask = cv2.bitwise_or(contrast_mask, strong_dark_mask)
+    mask = cv2.bitwise_and(mask, line_like_mask)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    return mask
+
+
+def find_line_center_in_roi(frame_small, top_ratio, bottom_ratio, min_area):
+    h, w = frame_small.shape[:2]
+
+    crop_left = int(CROP_LEFT_RATIO * w)
+    crop_right = int(CROP_RIGHT_RATIO * w)
+
+    roi_top = int(top_ratio * h)
+    roi_bottom = int(bottom_ratio * h)
+
+    roi = frame_small[roi_top:roi_bottom, crop_left:crop_right]
+    mask = create_black_mask(roi)
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if not contours:
+        return {
+            "found": False,
+            "center_x": None,
+            "center_y": None,
+            "area": 0,
+            "roi_top": roi_top,
+            "roi_bottom": roi_bottom,
+            "crop_left": crop_left,
+            "crop_right": crop_right,
+            "mask": mask,
+        }
+
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+
+    if area < min_area:
+        return {
+            "found": False,
+            "center_x": None,
+            "center_y": None,
+            "area": area,
+            "roi_top": roi_top,
+            "roi_bottom": roi_bottom,
+            "crop_left": crop_left,
+            "crop_right": crop_right,
+            "mask": mask,
+        }
+
+    M = cv2.moments(largest)
+
+    if M["m00"] <= 0:
+        return {
+            "found": False,
+            "center_x": None,
+            "center_y": None,
+            "area": area,
+            "roi_top": roi_top,
+            "roi_bottom": roi_bottom,
+            "crop_left": crop_left,
+            "crop_right": crop_right,
+            "mask": mask,
+        }
+
+    local_center_x = int(M["m10"] / M["m00"])
+    local_center_y = int(M["m01"] / M["m00"])
+
+    return {
+        "found": True,
+        "center_x": crop_left + local_center_x,
+        "center_y": roi_top + local_center_y,
+        "area": area,
+        "roi_top": roi_top,
+        "roi_bottom": roi_bottom,
+        "crop_left": crop_left,
+        "crop_right": crop_right,
+        "mask": mask,
     }
-  }
-}
 
-void handleCommand(String command) {
-  char action = toupper(command.charAt(0));
-  int value = currentSpeed;
 
-  if (command.length() > 1) {
-    String valueText = command.substring(1);
+def detect_line(frame):
+    frame_small = cv2.resize(
+        frame,
+        (DETECT_WIDTH, DETECT_HEIGHT),
+        interpolation=cv2.INTER_AREA,
+    )
 
-    if (valueText.charAt(0) == ':' || valueText.charAt(0) == ',') {
-      valueText = valueText.substring(1);
+    bottom = find_line_center_in_roi(
+        frame_small,
+        BOTTOM_ROI_TOP_RATIO,
+        BOTTOM_ROI_BOTTOM_RATIO,
+        MIN_LINE_AREA_BOTTOM,
+    )
+
+    lookahead = find_line_center_in_roi(
+        frame_small,
+        LOOKAHEAD_ROI_TOP_RATIO,
+        LOOKAHEAD_ROI_BOTTOM_RATIO,
+        MIN_LINE_AREA_LOOKAHEAD,
+    )
+
+    found_line = bottom["found"] or lookahead["found"]
+
+    h, w = frame_small.shape[:2]
+    reference_x = (w // 2) + CENTER_OFFSET_PX
+
+    bottom_error = 0
+    lookahead_error = 0
+
+    if bottom["found"]:
+        bottom_error = bottom["center_x"] - reference_x
+
+    if lookahead["found"]:
+        lookahead_error = lookahead["center_x"] - reference_x
+
+    weighted_error = 0
+    total_weight = 0
+
+    if bottom["found"]:
+        weighted_error += bottom_error * BOTTOM_WEIGHT
+        total_weight += BOTTOM_WEIGHT
+
+    if lookahead["found"]:
+        weighted_error += lookahead_error * LOOKAHEAD_WEIGHT
+        total_weight += LOOKAHEAD_WEIGHT
+
+    if total_weight > 0:
+        weighted_error = weighted_error / total_weight
+
+    scale_x = FRAME_WIDTH / DETECT_WIDTH
+    scale_y = FRAME_HEIGHT / DETECT_HEIGHT
+
+    return {
+        "found_line": found_line,
+        "bottom": bottom,
+        "lookahead": lookahead,
+        "reference_x": reference_x,
+        "bottom_error": bottom_error,
+        "lookahead_error": lookahead_error,
+        "weighted_error": weighted_error,
+        "frame_small_width": w,
+        "frame_small_height": h,
+        "scale_x": scale_x,
+        "scale_y": scale_y,
     }
 
-    valueText.trim();
-
-    if (valueText.length() > 0) {
-      value = valueText.toInt();
-    }
-  }
-
-  lastCommandAt = millis();
-
-  if (action == 'F') {
-    currentSpeed = constrain(value, 0, 100);
-    forward(currentSpeed);
-  } else if (action == 'B') {
-    currentSpeed = constrain(value, 0, 100);
-    backward(currentSpeed);
-  } else if (action == 'L') {
-    currentSpeed = constrain(value, 0, 100);
-    turnLeft(currentSpeed);
-  } else if (action == 'R') {
-    currentSpeed = constrain(value, 0, 100);
-    turnRight(currentSpeed);
-  } else if (action == 'Q') {
-    currentSpeed = constrain(value, 0, 100);
-    pivotLeft(currentSpeed);
-  } else if (action == 'E') {
-    currentSpeed = constrain(value, 0, 100);
-    pivotRight(currentSpeed);
-  } else if (action == 'S') {
-    emergencyStop();
-  } else if (action == 'X') {
-    emergencyStop();
-  } else if (action == 'V') {
-    currentSpeed = constrain(value, 0, 100);
-    Serial.print("Speed set to ");
-    Serial.println(currentSpeed);
-  } else if (action == 'A') {
-    setServoAngle(value);
-  } else if (action == 'U') {
-    // Report the latest filtered distance without blocking.
-    Serial.print("DIST:");
-    Serial.println(lastMedianDistanceCm);
-  } else {
-    smoothStop();
-    Serial.print("Unknown command: ");
-    Serial.println(command);
-  }
-}
-
-// -------------------- Movement logic --------------------
-
-void forward(int speed) {
-  speed = cleanSpeed(speed, MAX_DRIVE_SPEED);
-
-  setTargetAll(
-    speed,
-    speed,
-    speed,
-    speed
-  );
-
-  printDebug("Forward");
-}
-
-void backward(int speed) {
-  speed = cleanSpeed(speed, MAX_DRIVE_SPEED);
-
-  setTargetAll(
-    -speed,
-    -speed,
-    -speed,
-    -speed
-  );
-
-  printDebug("Backward");
-}
-
-void turnLeft(int speed) {
-  speed = cleanSpeed(speed, MAX_DRIVE_SPEED);
-
-  // Left side stopped, right side forward.
-  setTargetAll(
-    0,
-    speed,
-    0,
-    speed
-  );
-
-  printDebug("Arc left");
-}
-
-void turnRight(int speed) {
-  speed = cleanSpeed(speed, MAX_DRIVE_SPEED);
-
-  // Left side forward, right side stopped.
-  setTargetAll(
-    speed,
-    0,
-    speed,
-    0
-  );
-
-  printDebug("Arc right");
-}
-
-void pivotLeft(int speed) {
-  speed = cleanSpeed(speed, MAX_PIVOT_SPEED);
-  int pivotSpeed = scaledSpeed(speed, PIVOT_PERCENT);
-
-  // Left side stopped, right side forward.
-  // Soft pivot for finding lost line.
-  setTargetAll(
-    0,
-    pivotSpeed,
-    0,
-    pivotSpeed
-  );
-
-  printDebug("One-side pivot left");
-}
-
-void pivotRight(int speed) {
-  speed = cleanSpeed(speed, MAX_PIVOT_SPEED);
-  int pivotSpeed = scaledSpeed(speed, PIVOT_PERCENT);
-
-  // Left side forward, right side stopped.
-  setTargetAll(
-    pivotSpeed,
-    0,
-    pivotSpeed,
-    0
-  );
-
-  printDebug("One-side pivot right");
-}
-
-void smoothStop() {
-  setTargetAll(0, 0, 0, 0);
-  printDebug("Smooth stop");
-}
-
-void emergencyStop() {
-  for (int i = 0; i < motorCount; i++) {
-    targetSpeed[i] = 0;
-    currentMotorSpeed[i] = 0;
-    stopMotorImmediate(i);
-  }
-
-  printDebug("Emergency stop");
-}
-
-// -------------------- Smooth motor update --------------------
-
-void setTargetMotor(int index, int signedSpeed) {
-  targetSpeed[index] = constrain(signedSpeed, -100, 100);
-}
-
-void setTargetAll(int fl, int fr, int rl, int rr) {
-  setTargetMotor(0, fl);
-  setTargetMotor(1, fr);
-  setTargetMotor(2, rl);
-  setTargetMotor(3, rr);
-}
-
-void updateSmoothMotors() {
-  if (millis() - lastControlUpdate < CONTROL_INTERVAL_MS) {
-    return;
-  }
-
-  lastControlUpdate = millis();
-
-  for (int i = 0; i < motorCount; i++) {
-    currentMotorSpeed[i] = rampToward(currentMotorSpeed[i], targetSpeed[i]);
-    applyMotorSpeed(i, currentMotorSpeed[i]);
-  }
-}
-
-int rampToward(int current, int target) {
-  if (current == target) {
-    return current;
-  }
-
-  int step;
-
-  // If slowing down or changing direction, decelerate faster.
-  if (abs(target) < abs(current) || (current > 0 && target < 0) || (current < 0 && target > 0)) {
-    step = RAMP_STEP_DOWN;
-  } else {
-    step = RAMP_STEP_UP;
-  }
-
-  if (current < target) {
-    current += step;
-    if (current > target) current = target;
-  } else {
-    current -= step;
-    if (current < target) current = target;
-  }
-
-  // When changing direction, pass through zero first.
-  if ((current > 0 && target < 0) || (current < 0 && target > 0)) {
-    if (abs(current) < step) {
-      current = 0;
-    }
-  }
-
-  return current;
-}
-
-void applyMotorSpeed(int index, int signedSpeed) {
-  Motor motor = motors[index];
-
-  signedSpeed = constrain(signedSpeed, -100, 100);
-
-  if (signedSpeed == 0) {
-    stopMotorImmediate(index);
-    return;
-  }
-
-  bool forwardDirection = signedSpeed > 0;
-  int speed = abs(signedSpeed);
-  int pwmValue = speedToPwm(speed);
-
-  bool useForwardPins = forwardDirection == motor.forwardDirection;
-
-  if (useForwardPins) {
-    digitalWrite(motor.in1, HIGH);
-    digitalWrite(motor.in2, LOW);
-  } else {
-    digitalWrite(motor.in1, LOW);
-    digitalWrite(motor.in2, HIGH);
-  }
-
-  ledcWrite(motor.channel, pwmValue);
-}
-
-void stopMotorImmediate(int index) {
-  Motor motor = motors[index];
-
-  ledcWrite(motor.channel, 0);
-  digitalWrite(motor.in1, LOW);
-  digitalWrite(motor.in2, LOW);
-}
-
-// -------------------- Speed helpers --------------------
-
-int cleanSpeed(int speed, int maxSpeed) {
-  speed = constrain(speed, 0, maxSpeed);
-
-  if (speed > 0 && speed < MIN_ACTIVE_SPEED) {
-    speed = MIN_ACTIVE_SPEED;
-  }
-
-  return speed;
-}
-
-int scaledSpeed(int speed, int percent) {
-  int result = (speed * percent) / 100;
-
-  if (result > 0 && result < MIN_ACTIVE_SPEED) {
-    result = MIN_ACTIVE_SPEED;
-  }
-
-  return constrain(result, 0, 100);
-}
-
-int speedToPwm(int speed) {
-  speed = constrain(speed, 0, 100);
-
-  if (speed == 0) {
-    return 0;
-  }
-
-  int pwmValue = map(speed, 0, 100, 0, 255);
-  return max(pwmValue, MIN_ACTIVE_PWM);
-}
-
-// -------------------- Servo --------------------
-
-void setServoAngle(int angle) {
-  angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-  cameraServo.write(angle);
-
-  Serial.print("SERVO:");
-  Serial.println(angle);
-}
-
-// -------------------- Ultrasonic --------------------
-
-// Take one fast sample per interval and keep a median of the last 3.
-// This spreads the sensor cost over time so motor control stays smooth,
-// and pushes "DIST:<cm>" to the Python side automatically.
-void updateUltrasonic() {
-  if (millis() - lastUltrasonicAt < ULTRASONIC_INTERVAL_MS) {
-    return;
-  }
-
-  lastUltrasonicAt = millis();
-
-  distanceSamples[distanceSampleIndex] = readUltrasonicSampleCm();
-  distanceSampleIndex = (distanceSampleIndex + 1) % 3;
-
-  lastMedianDistanceCm = medianDistanceCm();
-
-  Serial.print("DIST:");
-  Serial.println(lastMedianDistanceCm);
-}
-
-float medianDistanceCm() {
-  float valid[3];
-  int validCount = 0;
-
-  for (int i = 0; i < 3; i++) {
-    if (distanceSamples[i] > 0) {
-      valid[validCount] = distanceSamples[i];
-      validCount++;
-    }
-  }
-
-  if (validCount == 0) {
-    return -1;
-  }
-
-  for (int i = 0; i < validCount - 1; i++) {
-    for (int j = i + 1; j < validCount; j++) {
-      if (valid[j] < valid[i]) {
-        float temp = valid[i];
-        valid[i] = valid[j];
-        valid[j] = temp;
-      }
-    }
-  }
-
-  return valid[validCount / 2];
-}
-
-float readUltrasonicSampleCm() {
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-  delayMicroseconds(2);
-
-  digitalWrite(ULTRASONIC_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(ULTRASONIC_TRIG, LOW);
-
-  unsigned long duration = pulseIn(ULTRASONIC_ECHO, HIGH, ULTRASONIC_TIMEOUT_US);
-
-  if (duration == 0) {
-    return -1;
-  }
-
-  float distanceCm = duration * 0.0343 / 2.0;
-  return distanceCm;
-}
-
-// -------------------- Debug --------------------
-
-void printDebug(const char* message) {
-  if (SERIAL_DEBUG) {
-    Serial.println(message);
-  }
-}
+
+def detect_obstacle_box(frame):
+    global latest_box_detections
+
+    latest_box_detections = []
+
+    if box_model is None:
+        return None, 0.0
+
+    try:
+        results = box_model(frame, verbose=False)
+    except Exception as exc:
+        print(f"YOLO inference failed: {exc}")
+        return None, 0.0
+
+    best_label = None
+    best_conf = 0.0
+
+    for result in results:
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+
+            if conf < BOX_CONFIDENCE_THRESHOLD:
+                continue
+
+            raw_label = box_model.names[cls_id]
+            label = str(raw_label).lower()
+
+            if "red" in label:
+                normalized_label = "redbox"
+            elif "green" in label:
+                normalized_label = "greenbox"
+            else:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            latest_box_detections.append(
+                {
+                    "label": normalized_label,
+                    "conf": conf,
+                    "xyxy": (x1, y1, x2, y2),
+                }
+            )
+
+            if conf > best_conf:
+                best_label = normalized_label
+                best_conf = conf
+
+    return best_label, best_conf
+
+
+# ----------------------------
+# Decision logic
+# ----------------------------
+def choose_follow_command(detection):
+    global smoothed_error, last_follow_action
+
+    smoothed_error = (
+        ERROR_SMOOTHING_ALPHA * detection["weighted_error"]
+        + (1.0 - ERROR_SMOOTHING_ALPHA) * smoothed_error
+    )
+
+    error = smoothed_error
+    abs_error = abs(error)
+
+    was_turning = last_follow_action is not None and last_follow_action[1] in ("Q", "E")
+
+    if was_turning:
+        forward_tolerance = CENTER_TOLERANCE * TURN_RELEASE_RATIO
+    else:
+        forward_tolerance = CENTER_TOLERANCE
+
+    # Early curve reaction.
+    if detection["lookahead"]["found"]:
+        lookahead_error = detection["lookahead_error"]
+        abs_lookahead_error = abs(lookahead_error)
+
+        if abs_lookahead_error > CENTER_TOLERANCE:
+            turn_speed = LINE_TURN_SPEED
+
+            if abs_lookahead_error > 90:
+                turn_speed += 7
+            elif abs_lookahead_error > 65:
+                turn_speed += 5
+            elif abs_lookahead_error > 45:
+                turn_speed += 3
+
+            turn_speed = max(20, min(28, turn_speed))
+
+            if lookahead_error < 0:
+                last_follow_action = ("EARLY CURVE LEFT", "Q", turn_speed)
+            else:
+                last_follow_action = ("EARLY CURVE RIGHT", "E", turn_speed)
+
+            return last_follow_action
+
+    if abs_error <= forward_tolerance:
+        decision = "FORWARD"
+        command = "F"
+        speed = ROBOT_SPEED
+
+        last_follow_action = (decision, command, speed)
+        return last_follow_action
+
+    turn_speed = LINE_TURN_SPEED
+
+    if abs_error > 90:
+        turn_speed += 11
+    elif abs_error > 65:
+        turn_speed += 9
+    elif abs_error > 45:
+        turn_speed += 3
+
+    turn_speed = max(20, min(28, turn_speed))
+
+    if error < 0:
+        last_follow_action = ("PIVOT LEFT", "Q", turn_speed)
+    else:
+        last_follow_action = ("PIVOT RIGHT", "E", turn_speed)
+
+    return last_follow_action
+
+
+def choose_recovery_command(detection):
+    global last_line_seen_at, recovery_found_streak
+
+    now = time.time()
+    elapsed = now - recovery_phase_started_at
+
+    if detection["found_line"]:
+        last_line_seen_at = now
+        recovery_found_streak += 1
+
+        if recovery_found_streak >= RECOVERY_EXIT_FOUND_FRAMES:
+            stop_recovery()
+            return choose_follow_command(detection)
+
+        return "RECOVERY CONFIRM LINE", "S", 0
+
+    recovery_found_streak = 0
+
+    if recovery_phase == "SEARCH_LEFT":
+        if elapsed < RECOVERY_SEARCH_TURN_SECONDS:
+            return "RECOVERY SEARCH LEFT", "Q", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_LEFT")
+        return "RECOVERY CHECK LEFT", "S", 0
+
+    if recovery_phase == "CHECK_LEFT":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK LEFT", "S", 0
+
+        set_recovery_phase("RETURN_CENTER_FROM_LEFT")
+        return "RECOVERY RETURN CENTER", "S", 0
+
+    if recovery_phase == "RETURN_CENTER_FROM_LEFT":
+        if elapsed < RECOVERY_RETURN_TURN_SECONDS:
+            return "RECOVERY RETURN CENTER FROM LEFT", "E", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_CENTER_1")
+        return "RECOVERY CHECK CENTER", "S", 0
+
+    if recovery_phase == "CHECK_CENTER_1":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK CENTER", "S", 0
+
+        set_recovery_phase("SEARCH_RIGHT")
+        return "RECOVERY PREP RIGHT", "S", 0
+
+    if recovery_phase == "SEARCH_RIGHT":
+        if elapsed < RECOVERY_SEARCH_TURN_SECONDS:
+            return "RECOVERY SEARCH RIGHT", "E", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_RIGHT")
+        return "RECOVERY CHECK RIGHT", "S", 0
+
+    if recovery_phase == "CHECK_RIGHT":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK RIGHT", "S", 0
+
+        set_recovery_phase("RETURN_CENTER_FROM_RIGHT")
+        return "RECOVERY RETURN CENTER", "S", 0
+
+    if recovery_phase == "RETURN_CENTER_FROM_RIGHT":
+        if elapsed < RECOVERY_RETURN_TURN_SECONDS:
+            return "RECOVERY RETURN CENTER FROM RIGHT", "Q", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_CENTER_2")
+        return "RECOVERY CHECK CENTER", "S", 0
+
+    if recovery_phase == "CHECK_CENTER_2":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK CENTER", "S", 0
+
+        if RECOVERY_REPEAT_SCAN:
+            set_recovery_phase("SEARCH_LEFT")
+            return "RECOVERY REPEAT SCAN", "S", 0
+
+        return "RECOVERY FAILED STOP", "S", 0
+
+    set_recovery_phase("SEARCH_LEFT")
+    return "RECOVERY RESET", "S", 0
+
+
+# ============================================================
+# TUNABLE OVERPASS FUNCTIONS - TABLE-DRIVEN PATH
+# ============================================================
+def overpass_begin(label, conf):
+    global obstacle_box_label, obstacle_box_conf, obstacle_overpass_side
+    global overpass_found_line_streak
+    global overpass_steps, overpass_step_index
+    global overpass_back_in_started_at
+
+    obstacle_box_label = label
+    obstacle_box_conf = conf
+    overpass_found_line_streak = 0
+    overpass_step_index = 0
+    overpass_back_in_started_at = 0.0
+
+    if label == "greenbox":
+        obstacle_overpass_side = "LEFT"
+        overpass_steps = LEFT_OVERPASS_STEPS
+        print("GREEN BOX: using tunable LEFT overpass path.")
+    elif label == "redbox":
+        obstacle_overpass_side = "RIGHT"
+        overpass_steps = RIGHT_OVERPASS_STEPS
+        print("RED BOX: using tunable RIGHT overpass path.")
+    else:
+        obstacle_overpass_side = "LEFT"
+        overpass_steps = LEFT_OVERPASS_STEPS
+        print("UNKNOWN BOX: defaulting to tunable LEFT overpass path.")
+
+    set_servo_angle(SERVO_DEFAULT_ANGLE, force=True)
+    set_obstacle_phase("OVERPASS_RUN")
+
+    if overpass_steps:
+        print(f"Overpass step: {overpass_steps[0]['name']}")
+
+
+def overpass_go_next_step():
+    global overpass_step_index, obstacle_phase_started_at
+    global overpass_back_in_started_at
+
+    overpass_step_index += 1
+    obstacle_phase_started_at = time.time()
+
+    if overpass_step_index >= len(overpass_steps):
+        # Repeat last 2 steps forever until line found or timeout.
+        # These should be the back-in/search-line steps.
+        overpass_step_index = max(0, len(overpass_steps) - 2)
+
+    current_step = overpass_steps[overpass_step_index]
+
+    if current_step.get("check_line", False) and overpass_back_in_started_at <= 0:
+        overpass_back_in_started_at = time.time()
+
+    print(f"Overpass step: {current_step['name']}")
+
+
+def overpass_try_resume_line_follow(detection):
+    global overpass_found_line_streak
+
+    if detection["found_line"]:
+        overpass_found_line_streak += 1
+
+        if overpass_found_line_streak >= OVERPASS_EXIT_FOUND_FRAMES:
+            exit_obstacle_mode()
+            return choose_follow_command(detection)
+    else:
+        overpass_found_line_streak = 0
+
+    return None
+
+
+def overpass_command(detection):
+    global overpass_step_index
+    global obstacle_phase_started_at
+
+    now = time.time()
+
+    if now < overpass_brake_until:
+        return "OVERPASS BRAKE", "S", 0
+
+    if not overpass_steps:
+        robot.send("S", force=True)
+        exit_obstacle_mode()
+        start_recovery()
+        return "OVERPASS NO STEPS", "S", 0
+
+    if overpass_step_index >= len(overpass_steps):
+        overpass_step_index = len(overpass_steps) - 1
+
+    current_step = overpass_steps[overpass_step_index]
+    elapsed = now - obstacle_phase_started_at
+
+    # Only detect line again during return/search steps.
+    if current_step.get("check_line", False):
+        resumed = overpass_try_resume_line_follow(detection)
+        if resumed is not None:
+            return resumed
+
+    if elapsed < current_step["seconds"]:
+        return (
+            current_step["name"],
+            current_step["command"],
+            current_step["speed"],
+        )
+
+    robot.send("S", force=True)
+    overpass_go_next_step()
+
+    current_step = overpass_steps[overpass_step_index]
+
+    return (
+        current_step["name"],
+        current_step["command"],
+        current_step["speed"],
+    )
+
+
+def choose_obstacle_command(detection, frame):
+    global last_line_seen_at
+
+    now = time.time()
+    elapsed = now - obstacle_phase_started_at
+
+    # While obstacle handling, prevent normal lost-line recovery from triggering.
+    last_line_seen_at = now
+
+    if obstacle_phase == "SCAN_SETTLE":
+        set_servo_angle(SERVO_OBSTACLE_ANGLE)
+
+        if elapsed < OBSTACLE_SERVO_SETTLE_SECONDS:
+            return "OBSTACLE SCAN SETTLE", "S", 0
+
+        set_obstacle_phase("SCAN_BOX")
+        return "OBSTACLE SCAN BOX", "S", 0
+
+    if obstacle_phase == "SCAN_BOX":
+        set_servo_angle(SERVO_OBSTACLE_ANGLE)
+        label, conf = detect_obstacle_box(frame)
+
+        if label is None:
+            if elapsed >= OBSTACLE_SCAN_BOX_TIMEOUT_SECONDS:
+                robot.send("S", force=True)
+                exit_obstacle_mode()
+
+                if detection["found_line"]:
+                    return choose_follow_command(detection)
+
+                start_recovery()
+                return "OBSTACLE BOX TIMEOUT", "S", 0
+
+            if box_model is None:
+                return "OBSTACLE NO YOLO MODEL", "S", 0
+
+            return "OBSTACLE LOOKING BOX", "S", 0
+
+        overpass_begin(label, conf)
+        return f"{label.upper()} TUNABLE OVERPASS START", "S", 0
+
+    if obstacle_phase == "OVERPASS_RUN":
+        set_servo_angle(SERVO_DEFAULT_ANGLE)
+
+        if (
+            overpass_back_in_started_at > 0
+            and now - overpass_back_in_started_at > OVERPASS_BACK_IN_TOTAL_TIMEOUT_SECONDS
+        ):
+            robot.send("S", force=True)
+            exit_obstacle_mode()
+            start_recovery()
+            return "OVERPASS BACK IN TIMEOUT", "S", 0
+
+        return overpass_command(detection)
+
+    set_obstacle_phase("SCAN_SETTLE")
+    return "OBSTACLE RESET", "S", 0
+
+
+def decide_robot_action(detection, frame):
+    global last_line_seen_at, last_follow_action
+
+    now = time.time()
+
+    if obstacle_mode:
+        return choose_obstacle_command(detection, frame)
+
+    if recovery_mode:
+        return choose_recovery_command(detection)
+
+    if detection["found_line"]:
+        last_line_seen_at = now
+
+        if servo_angle_now != SERVO_DEFAULT_ANGLE:
+            set_servo_angle(SERVO_DEFAULT_ANGLE)
+
+        return choose_follow_command(detection)
+
+    time_since_line_seen = now - last_line_seen_at
+
+    if time_since_line_seen >= LOST_LINE_START_SECONDS:
+        start_recovery()
+        return "START RECOVERY", "S", 0
+
+    # Do not coast forward when line is lost.
+    if last_follow_action is not None:
+        last_follow_action = None
+        return "LINE LOST WAIT", "S", 0
+
+    return "LINE LOST WAIT", "S", 0
+
+
+# ----------------------------
+# Debug drawing
+# ----------------------------
+def draw_roi_box(frame, roi_info, scale_x, scale_y, color, label):
+    x1 = int(roi_info["crop_left"] * scale_x)
+    x2 = int(roi_info["crop_right"] * scale_x)
+    y1 = int(roi_info["roi_top"] * scale_y)
+    y2 = int(roi_info["roi_bottom"] * scale_y)
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    cv2.putText(
+        frame,
+        label,
+        (x1 + 8, y1 + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+    )
+
+    if roi_info["found"]:
+        cx = int(roi_info["center_x"] * scale_x)
+        cy = int(roi_info["center_y"] * scale_y)
+
+        cv2.circle(frame, (cx, cy), 8, color, -1)
+
+
+def draw_debug(frame, detection, decision, command, speed):
+    h, w = frame.shape[:2]
+
+    scale_x = detection["scale_x"]
+    scale_y = detection["scale_y"]
+
+    if obstacle_mode:
+        color = (0, 0, 255)
+    elif detection["found_line"]:
+        color = (0, 255, 0)
+    elif recovery_mode:
+        color = (0, 255, 255)
+    else:
+        color = (0, 0, 255)
+
+    center_x = int(detection["reference_x"] * scale_x)
+    tolerance_full = int(CENTER_TOLERANCE * scale_x)
+
+    cv2.line(frame, (center_x, 0), (center_x, h), (255, 255, 0), 2)
+    cv2.line(frame, (center_x - tolerance_full, 0), (center_x - tolerance_full, h), (120, 120, 0), 1)
+    cv2.line(frame, (center_x + tolerance_full, 0), (center_x + tolerance_full, h), (120, 120, 0), 1)
+
+    draw_roi_box(
+        frame,
+        detection["lookahead"],
+        scale_x,
+        scale_y,
+        (255, 0, 255),
+        "LOOKAHEAD",
+    )
+
+    draw_roi_box(
+        frame,
+        detection["bottom"],
+        scale_x,
+        scale_y,
+        (0, 255, 0),
+        "BOTTOM",
+    )
+
+    cv2.putText(
+        frame,
+        f"{decision} | CMD {command} | SPD {int(speed)}",
+        (10, 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.70,
+        color,
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"ERR W:{int(detection['weighted_error'])} B:{int(detection['bottom_error'])} L:{int(detection['lookahead_error'])}",
+        (10, 64),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 0),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"AREA B:{int(detection['bottom']['area'])} L:{int(detection['lookahead']['area'])} | SERVO {servo_angle_now}",
+        (10, 94),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (255, 255, 0),
+        2,
+    )
+
+    if obstacle_mode:
+        mode_text = "OBSTACLE"
+    elif recovery_mode:
+        mode_text = "RECOVERY"
+    else:
+        mode_text = "FOLLOW"
+
+    distance_cm, _ = robot.get_distance()
+
+    if distance_cm is None:
+        distance_text = "--"
+    elif distance_cm <= 0:
+        distance_text = "CLEAR"
+    else:
+        distance_text = f"{distance_cm:.0f}cm"
+
+    cv2.putText(
+        frame,
+        f"MODE {mode_text} | RECOVERY {recovery_phase} | DIST {distance_text}",
+        (10, 124),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.54,
+        (255, 255, 255),
+        2,
+    )
+
+    step_text = "--"
+    if obstacle_mode and obstacle_phase == "OVERPASS_RUN" and overpass_steps:
+        safe_index = min(overpass_step_index, len(overpass_steps) - 1)
+        step_text = overpass_steps[safe_index]["name"]
+
+    cv2.putText(
+        frame,
+        f"OBSTACLE {obstacle_phase} | BOX {obstacle_box_label or '--'} {obstacle_box_conf:.2f} | SIDE {obstacle_overpass_side or '--'}",
+        (10, 154),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.54,
+        (255, 255, 255),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"OVERPASS STEP {overpass_step_index}: {step_text}",
+        (10, 184),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (255, 255, 255),
+        2,
+    )
+
+    for box in latest_box_detections:
+        x1, y1, x2, y2 = box["xyxy"]
+        label = box["label"]
+        conf = box["conf"]
+        box_color = (0, 255, 0) if label == "greenbox" else (0, 0, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(
+            frame,
+            f"{label} {conf:.2f}",
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            box_color,
+            2,
+        )
+
+
+# ----------------------------
+# Frame publishing
+# ----------------------------
+def publish_frame(frame):
+    global latest_frame, latest_frame_seq
+
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+    )
+
+    if ok:
+        with latest_frame_lock:
+            latest_frame = buffer.tobytes()
+            latest_frame_seq += 1
+
+
+def publish_status_frame(message):
+    frame = np.zeros((240, 560, 3), dtype=np.uint8)
+
+    cv2.putText(
+        frame,
+        message,
+        (18, 112),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+    )
+
+    publish_frame(frame)
+
+
+# ----------------------------
+# Camera
+# ----------------------------
+def open_camera():
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        cap.release()
+        return None
+
+    for _ in range(3):
+        cap.read()
+
+    ok, frame = cap.read()
+
+    if ok and frame is not None:
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"Using camera index {CAMERA_INDEX}: {actual_w}x{actual_h} @ {actual_fps:.1f} FPS")
+        return cap
+
+    print(f"Camera index {CAMERA_INDEX} opened but did not return frames.")
+    cap.release()
+    return None
+
+
+def camera_control_loop():
+    global running
+
+    cap = None
+    camera_read_failed = False
+    last_camera_unavailable_log_at = 0.0
+
+    publish_status_frame("Starting camera...")
+
+    try:
+        while running:
+            loop_started_at = time.time()
+
+            if cap is None:
+                cap = open_camera()
+
+                if cap is None:
+                    now = time.time()
+
+                    if now - last_camera_unavailable_log_at >= CAMERA_UNAVAILABLE_LOG_INTERVAL:
+                        print("Camera unavailable; robot stopped and retrying.")
+                        robot.send("S", force=True)
+                        publish_status_frame("Camera unavailable")
+                        last_camera_unavailable_log_at = now
+
+                    time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
+                    continue
+
+            ok = cap.grab()
+            if not ok:
+                frame = None
+            else:
+                ok, frame = cap.retrieve()
+
+            if not ok or frame is None:
+                if not camera_read_failed:
+                    print("Camera read failed; stopping robot until frames return.")
+                    robot.send("S", force=True)
+                    publish_status_frame("Camera read failed")
+                    camera_read_failed = True
+
+                cap.release()
+                cap = None
+                time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
+                continue
+
+            if camera_read_failed:
+                print("Camera frames returned.")
+                camera_read_failed = False
+
+            if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+
+            robot.poll_responses()
+            update_obstacle_state()
+
+            detection = detect_line(frame)
+            decision, command, speed = decide_robot_action(detection, frame)
+
+            robot.send(command, speed)
+
+            draw_debug(frame, detection, decision, command, speed)
+
+            elapsed_ms = (time.time() - loop_started_at) * 1000.0
+            cv2.putText(
+                frame,
+                f"LOOP {elapsed_ms:.1f}ms",
+                (10, FRAME_HEIGHT - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+
+            publish_frame(frame)
+
+    finally:
+        robot.close()
+
+        if cap is not None:
+            cap.release()
+
+
+def generate_frames():
+    sent_frame_seq = -1
+
+    while running:
+        with latest_frame_lock:
+            frame = latest_frame
+            frame_seq = latest_frame_seq
+
+        if frame is None or frame_seq == sent_frame_seq:
+            time.sleep(0.005)
+            continue
+
+        sent_frame_seq = frame_seq
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        )
+
+
+@app.route("/")
+def index():
+    return """
+<!doctype html>
+<html>
+<head>
+    <title>Robot Line Detection</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            color: white;
+            font-family: Arial, sans-serif;
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 22px;
+            margin: 16px 0;
+        }
+
+        img {
+            width: 100%;
+            max-width: 720px;
+            height: auto;
+            border: 2px solid #333;
+            background: black;
+        }
+
+        .hint {
+            color: #bbb;
+            font-size: 14px;
+            margin: 10px auto 18px;
+            max-width: 760px;
+            padding: 0 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Robot Line Detection</h1>
+    <div class="hint">
+        Capture 640x480, detect 320x240. Tunable green/red obstacle overpass controller.
+    </div>
+    <img src="/video_feed" alt="Robot camera stream">
+</body>
+</html>
+"""
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        generate_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+if __name__ == "__main__":
+    worker = threading.Thread(target=camera_control_loop, daemon=True)
+    worker.start()
+
+    try:
+        app.run(host="0.0.0.0", port=5000, threaded=True)
+    finally:
+        running = False
+        robot.close()

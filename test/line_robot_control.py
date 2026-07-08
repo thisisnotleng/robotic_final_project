@@ -1,9 +1,15 @@
 from flask import Flask, Response
 import cv2
 import numpy as np
+import os
 import serial
 import threading
 import time
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 
 # ----------------------------
@@ -13,32 +19,23 @@ SERIAL_PORT = "/dev/ttyUSB0"
 BAUD_RATE = 115200
 
 # Servo angles
-# Camera looks down at the line by default. It only lifts to
-# SERVO_OBSTACLE_ANGLE while an obstacle is blocking the path.
 SERVO_DEFAULT_ANGLE = 0
 SERVO_OBSTACLE_ANGLE = 15
 
-# Recovery no longer tilts the camera; keeping both scan angles at the
-# default means the servo stays still while searching for the line.
 SERVO_RIGHT_SCAN_ANGLE = SERVO_DEFAULT_ANGLE
 SERVO_LEFT_SCAN_ANGLE = SERVO_DEFAULT_ANGLE
 
 # Normal movement tuning
-ROBOT_SPEED = 17
-MIN_FOLLOW_SPEED = 10
+ROBOT_SPEED = 8
+MIN_FOLLOW_SPEED = 5
 MAX_FOLLOW_SPEED = 25
 
-# Pivot/turn speed while following line.
-# Keep this gentle; the camera view shows pure pivots can overshoot the
-# center quickly and throw the line out of frame.
-LINE_TURN_SPEED = 15
+# Stronger turn speed for curves.
+LINE_TURN_SPEED = 19
 
-# Lost-line recovery turn speed.
-# Keep recovery slower than before so it can reacquire the line without
-# sweeping past it too quickly.
-RECOVERY_TURN_SPEED = 18
+# Recovery turn must not be weak.
+RECOVERY_TURN_SPEED = 20
 
-# Send serial commands fast enough for live line following
 COMMAND_SEND_INTERVAL = 0.02
 SAME_COMMAND_INTERVAL = 0.05
 
@@ -46,69 +43,172 @@ SAME_COMMAND_INTERVAL = 0.05
 # ----------------------------
 # Lost-line recovery behavior
 # ----------------------------
-# Wait a bit before declaring the line lost, so short detection
-# dropouts do not snap the servo and restart recovery over and over.
-LOST_LINE_START_SECONDS = 0.35
+LOST_LINE_START_SECONDS = 0.12
 
-# Reasonable recovery turn duration.
-# Increase if it does not rotate enough.
-# Decrease if it rotates too much.
-RECOVERY_TURN_SECONDS = 0.50
-
-# Stop and let camera check.
-RECOVERY_CHECK_SECONDS = 0.80
+RECOVERY_SEARCH_TURN_SECONDS = 1.15
+RECOVERY_RETURN_TURN_SECONDS = 1.08
+RECOVERY_CHECK_SECONDS = 0.20
+RECOVERY_REPEAT_SCAN = True
 
 
 # ----------------------------
 # Smoothness tuning
 # ----------------------------
-# Blend factor for the steering error (0..1).
-# Lower = smoother steering, higher = faster reaction.
-ERROR_SMOOTHING_ALPHA = 0.6
-
-# While pivoting, only switch back to FORWARD once the error is within
-# CENTER_TOLERANCE * TURN_RELEASE_RATIO.
-# This hysteresis stops the rapid F/Q/E flickering right at the
-# tolerance edge.
-TURN_RELEASE_RATIO = 0.6
-
-# Line must be visible this many consecutive frames before leaving
-# recovery, so one noisy frame does not flap the mode and the servo.
+ERROR_SMOOTHING_ALPHA = 0.8
+TURN_RELEASE_RATIO = 0.7
 RECOVERY_EXIT_FOUND_FRAMES = 3
-
-# Minimum seconds between physical servo moves.
-# Stops the servo from being hammered with rapid angle changes.
 SERVO_MOVE_MIN_INTERVAL = 0.5
-
-# Shift the steering reference (the yellow center line) left/right,
-# in detection pixels (at DETECT_WIDTH=320).
-# Use this if the camera is mounted slightly off-center and the center
-# line does not sit on the ground line even when the robot is centered.
-# Negative = move reference left, positive = move right.
 CENTER_OFFSET_PX = 0
 
 
 # ----------------------------
-# Obstacle detection (ultrasonic)
+# Obstacle detection
 # ----------------------------
-# The firmware pushes "DIST:<cm>" lines automatically (~every 60ms).
+OBSTACLE_STOP_CM = 40.0
+OBSTACLE_CLEAR_EXIT_CM = 55.0
 
-# Stop when an obstacle is at or closer than this.
-OBSTACLE_STOP_CM = 25.0
-
-# Resume only once the path opens beyond this. The gap between stop and
-# clear is hysteresis, so the robot does not flap right at 25cm.
-OBSTACLE_CLEAR_CM = 32.0
-
-# Consecutive readings below OBSTACLE_STOP_CM before stopping,
-# so one noisy echo does not halt the robot.
 OBSTACLE_CONFIRM_READINGS = 2
-
-# Path must stay clear this long before resuming.
-OBSTACLE_CLEAR_SECONDS = 0.5
-
-# Ignore distance readings older than this (serial hiccup safety).
 ULTRASONIC_STALE_SECONDS = 1.0
+
+OBSTACLE_SCAN_BOX_TIMEOUT_SECONDS = 1.20
+
+YOLO_MODEL_PATHS = [
+    os.path.join(os.path.dirname(__file__), "best.onnx"),
+    os.path.join(os.getcwd(), "best.onnx"),
+]
+BOX_CONFIDENCE_THRESHOLD = 0.45
+OBSTACLE_SERVO_SETTLE_SECONDS = 0.45
+
+# Briefly rotate toward the detected box before running the timed overpass path.
+OBSTACLE_ALIGN_ENABLED = True
+OBSTACLE_ALIGN_TOLERANCE_PX = 55
+OBSTACLE_ALIGN_SPEED = 20
+OBSTACLE_ALIGN_TIMEOUT_SECONDS = 0.75
+
+
+# ============================================================
+# SEPARATE TUNABLE OBSTACLE OVERPASS CONTROLLER
+# ============================================================
+# This section is completely separate from normal line following.
+#
+# It does NOT use:
+# - ROBOT_SPEED
+# - LINE_TURN_SPEED
+# - RECOVERY_TURN_SPEED
+#
+# Green box = overpass LEFT.
+# Red box   = overpass RIGHT.
+#
+# Each step:
+# {
+#     "name": debug name,
+#     "command": "F" / "Q" / "E" / "S",
+#     "speed": speed value,
+#     "seconds": duration,
+#     "check_line": True/False,
+# }
+#
+# IMPORTANT:
+# - check_line False = ignore line detection during escape/bypass.
+# - check_line True  = robot starts looking for line again.
+# ============================================================
+
+OVERPASS_BRAKE_SECONDS = 0.08
+OVERPASS_EXIT_FOUND_FRAMES = 2
+OVERPASS_BACK_IN_TOTAL_TIMEOUT_SECONDS = 5.00
+
+# Green box = move out LEFT, then come back RIGHT.
+LEFT_OVERPASS_STEPS = [
+    {
+        "name": "LEFT: rotate out left",
+        "command": "Q",
+        "speed": 30,
+        "seconds": 0.6,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: forward out from line",
+        "command": "F",
+        "speed": 20,
+        "seconds": 1.2,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: rotate right to parallel",
+        "command": "E",
+        "speed": 28,
+        "seconds": 0.7,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: forward beside obstacle",
+        "command": "F",
+        "speed": 17,
+        "seconds": 1.8,
+        "check_line": False,
+    },
+    {
+        "name": "LEFT: turn right back to line",
+        "command": "E",
+        "speed": 22,
+        "seconds": 0.16,
+        "check_line": True,
+    },
+    {
+        "name": "LEFT: forward search line",
+        "command": "F",
+        "speed": 13,
+        "seconds": 0.18,
+        "check_line": True,
+    },
+]
+
+# Red box = move out RIGHT, then come back LEFT.
+# Right turn uses stronger speed because your robot's right turn is weaker.
+RIGHT_OVERPASS_STEPS = [
+    {
+        "name": "RIGHT: rotate out right",
+        "command": "E",
+        "speed": 30,
+        "seconds": 0.6,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: forward out from line",
+        "command": "F",
+        "speed": 17,
+        "seconds": 0.60,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: rotate left to parallel",
+        "command": "Q",
+        "speed": 28,
+        "seconds": 0.30,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: forward beside obstacle",
+        "command": "F",
+        "speed": 17,
+        "seconds": 1.25,
+        "check_line": False,
+    },
+    {
+        "name": "RIGHT: turn left back to line",
+        "command": "Q",
+        "speed": 22,
+        "seconds": 0.16,
+        "check_line": True,
+    },
+    {
+        "name": "RIGHT: forward search line",
+        "command": "F",
+        "speed": 13,
+        "seconds": 0.18,
+        "check_line": True,
+    },
+]
 
 
 # ----------------------------
@@ -116,20 +216,12 @@ ULTRASONIC_STALE_SECONDS = 1.0
 # ----------------------------
 CAMERA_INDEX = 0
 
-# Capture resolution:
-# 640x360 is a good balance:
-# - not too heavy like 640x480
-# - better than 320x240 for future QR/stream
-# - 16:9 camera view is usually cleaner
 FRAME_WIDTH = 640
-FRAME_HEIGHT = 360
+FRAME_HEIGHT = 480
 CAMERA_FPS = 30
 
-# Detection resolution:
-# Line following does not need full 640.
-# This keeps latency low.
 DETECT_WIDTH = 320
-DETECT_HEIGHT = 180
+DETECT_HEIGHT = 240
 
 CAMERA_REOPEN_DELAY_SECONDS = 1.0
 CAMERA_UNAVAILABLE_LOG_INTERVAL = 5.0
@@ -139,49 +231,27 @@ JPEG_QUALITY = 78
 # ----------------------------
 # Line detection configuration
 # ----------------------------
-
-# Use grayscale dark-line detection, faster and usually cleaner than HSV
-# for this floor. The tape appears as dark gray in the camera, so this
-# cannot be too low or the robot will miss the line.
 BLACK_THRESHOLD = 135
-
-# Also require local contrast: the line must be this much darker than the
-# nearby floor/wall around it. Keep this gentle because the tape is broad
-# enough that an aggressive contrast filter can erase the middle of it.
 BLACK_LOCAL_CONTRAST = 10
-
-# Always keep pixels this dark even if local contrast is weak.
 BLACK_STRONG_THRESHOLD = 90
 
-# Ignore tiny noise at 320x180 detection resolution.
-MIN_LINE_AREA_BOTTOM = 90
-MIN_LINE_AREA_LOOKAHEAD = 60
+MIN_LINE_AREA_BOTTOM = 70
+MIN_LINE_AREA_LOOKAHEAD = 45
 
-# Two ROI system:
-# Bottom ROI = current position
-# Lookahead ROI = upcoming curve
-BOTTOM_ROI_TOP_RATIO = 0.68
+BOTTOM_ROI_TOP_RATIO = 0.70
 BOTTOM_ROI_BOTTOM_RATIO = 0.98
 
-LOOKAHEAD_ROI_TOP_RATIO = 0.42
-LOOKAHEAD_ROI_BOTTOM_RATIO = 0.68
+LOOKAHEAD_ROI_TOP_RATIO = 0.45
+LOOKAHEAD_ROI_BOTTOM_RATIO = 0.70
 
-# Tolerance at DETECT_WIDTH=320.
-# Wide center band prevents small angle changes from immediately pushing
-# the detected line outside the forward zone.
-CENTER_TOLERANCE = 72
+CENTER_TOLERANCE = 50
 
-# How much lookahead affects steering.
-# Higher = reacts earlier to curves.
-LOOKAHEAD_WEIGHT = 0.65
+LOOKAHEAD_WEIGHT = 1.35
 BOTTOM_WEIGHT = 1.00
 
-# Crop edges if robot body/wheels appear.
 CROP_LEFT_RATIO = 0.00
 CROP_RIGHT_RATIO = 1.00
 
-# Optional: if lighting is noisy, use Otsu threshold instead of fixed threshold.
-# Fixed threshold is faster and more predictable.
 USE_OTSU_THRESHOLD = False
 
 
@@ -240,8 +310,6 @@ class RobotSerial:
         self.send("A", angle, force=force)
 
     def poll_responses(self):
-        # Non-blocking read of firmware output.
-        # We only care about the auto-pushed "DIST:<cm>" lines.
         if not self.ser or not self.ser.is_open:
             return
 
@@ -270,8 +338,6 @@ class RobotSerial:
                     pass
 
     def get_distance(self):
-        # Returns (distance_cm, measured_at). (None, 0.0) when unknown.
-        # distance_cm <= 0 means no echo (nothing in sensor range).
         if self.last_distance_cm is None:
             return None, 0.0
 
@@ -314,9 +380,23 @@ class RobotSerial:
 
 robot = RobotSerial(SERIAL_PORT, BAUD_RATE)
 
+box_model = None
+box_model_path = next((path for path in YOLO_MODEL_PATHS if os.path.exists(path)), None)
+
+if YOLO is None:
+    print("ultralytics is not installed; obstacle box classification is disabled.")
+elif box_model_path is None:
+    print(f"YOLO model not found at {YOLO_MODEL_PATHS}; obstacle box classification is disabled.")
+else:
+    try:
+        box_model = YOLO(box_model_path)
+        print(f"Loaded YOLO model: {box_model_path}")
+    except Exception as exc:
+        print(f"Could not load YOLO model {box_model_path}: {exc}")
+
 
 # ----------------------------
-# Recovery state
+# State
 # ----------------------------
 last_line_seen_at = time.time()
 recovery_mode = False
@@ -330,34 +410,61 @@ last_follow_action = None
 
 # Obstacle state
 obstacle_mode = False
+obstacle_phase = "CLEAR"
+obstacle_phase_started_at = 0.0
 obstacle_below_count = 0
-obstacle_clear_since = None
 obstacle_last_reading_at = 0.0
+obstacle_box_label = None
+obstacle_box_conf = 0.0
+obstacle_overpass_side = None
+obstacle_align_label = None
+obstacle_align_conf = 0.0
+obstacle_align_error = 0
+overpass_found_line_streak = 0
+latest_box_detections = []
+
+# Tunable overpass internal state
+overpass_brake_until = 0.0
+overpass_back_in_started_at = 0.0
+overpass_steps = []
+overpass_step_index = 0
 
 
 def set_recovery_phase(phase):
     global recovery_phase, recovery_phase_started_at
-
     recovery_phase = phase
     recovery_phase_started_at = time.time()
     print(f"Recovery phase: {phase}")
 
 
-def set_servo_angle(angle):
+def set_servo_angle(angle, force=False):
     global servo_angle_now, servo_last_moved_at
 
-    if servo_angle_now == angle:
+    if servo_angle_now == angle and not force:
         return
 
-    # Rate-limit physical servo moves. Callers re-assert the angle every
-    # frame, so a skipped move is retried once the interval has passed.
     now = time.time()
-    if now - servo_last_moved_at < SERVO_MOVE_MIN_INTERVAL:
+    if not force and now - servo_last_moved_at < SERVO_MOVE_MIN_INTERVAL:
         return
 
     servo_angle_now = angle
     servo_last_moved_at = now
     robot.send_servo(angle, force=True)
+
+
+def set_obstacle_phase(phase):
+    global obstacle_phase, obstacle_phase_started_at
+    global overpass_brake_until
+
+    obstacle_phase = phase
+    obstacle_phase_started_at = time.time()
+
+    if phase == "OVERPASS_RUN":
+        overpass_brake_until = time.time() + OVERPASS_BRAKE_SECONDS
+    else:
+        overpass_brake_until = 0.0
+
+    print(f"Obstacle phase: {phase}")
 
 
 def start_recovery():
@@ -366,8 +473,10 @@ def start_recovery():
     recovery_mode = True
     recovery_found_streak = 0
     last_follow_action = None
-    set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
-    set_recovery_phase("TURN_RIGHT")
+
+    robot.send("S", force=True)
+    set_servo_angle(SERVO_DEFAULT_ANGLE)
+    set_recovery_phase("SEARCH_LEFT")
 
 
 def stop_recovery():
@@ -384,49 +493,84 @@ def stop_recovery():
 # Obstacle handling
 # ----------------------------
 def enter_obstacle_mode():
-    global obstacle_mode, obstacle_clear_since, recovery_mode, last_follow_action
+    global obstacle_mode, recovery_mode, last_follow_action
+    global obstacle_box_label, obstacle_box_conf, obstacle_overpass_side
+    global obstacle_align_label, obstacle_align_conf, obstacle_align_error
+    global overpass_found_line_streak, latest_box_detections
+    global overpass_brake_until, overpass_back_in_started_at
+    global overpass_steps, overpass_step_index
 
     obstacle_mode = True
-    obstacle_clear_since = None
     last_follow_action = None
+    obstacle_box_label = None
+    obstacle_box_conf = 0.0
+    obstacle_overpass_side = None
+    obstacle_align_label = None
+    obstacle_align_conf = 0.0
+    obstacle_align_error = 0
+    overpass_found_line_streak = 0
+    latest_box_detections = []
 
-    # Abandon any recovery; it restarts fresh if the line is still lost
-    # after the obstacle clears.
+    overpass_brake_until = 0.0
+    overpass_back_in_started_at = 0.0
+    overpass_steps = []
+    overpass_step_index = 0
+
     if recovery_mode:
         recovery_mode = False
         set_recovery_phase("NORMAL")
 
     robot.send("S", force=True)
-    set_servo_angle(SERVO_OBSTACLE_ANGLE)
-    print("Obstacle detected: robot stopped, servo lifted.")
+    set_servo_angle(SERVO_OBSTACLE_ANGLE, force=True)
+    set_obstacle_phase("SCAN_SETTLE")
+    print("Obstacle detected: robot stopped, servo moved for box scan.")
 
 
 def exit_obstacle_mode():
     global obstacle_mode, obstacle_below_count, last_line_seen_at
+    global obstacle_box_label, obstacle_box_conf, obstacle_overpass_side
+    global obstacle_align_label, obstacle_align_conf, obstacle_align_error
+    global overpass_found_line_streak, latest_box_detections
+    global overpass_brake_until, overpass_back_in_started_at
+    global overpass_steps, overpass_step_index
+    global smoothed_error, last_follow_action
 
     obstacle_mode = False
     obstacle_below_count = 0
-    set_servo_angle(SERVO_DEFAULT_ANGLE)
+    obstacle_box_label = None
+    obstacle_box_conf = 0.0
+    obstacle_overpass_side = None
+    obstacle_align_label = None
+    obstacle_align_conf = 0.0
+    obstacle_align_error = 0
+    overpass_found_line_streak = 0
+    latest_box_detections = []
 
-    # Give the camera a fresh lost-line window so recovery does not fire
-    # the instant the robot resumes.
+    overpass_brake_until = 0.0
+    overpass_back_in_started_at = 0.0
+    overpass_steps = []
+    overpass_step_index = 0
+
+    smoothed_error = 0.0
+    last_follow_action = None
+
+    set_obstacle_phase("CLEAR")
+    set_servo_angle(SERVO_DEFAULT_ANGLE, force=True)
+
     last_line_seen_at = time.time()
-    print("Obstacle cleared: resuming line following.")
+    print("Obstacle handling complete: resuming line following.")
 
 
 def update_obstacle_state():
-    global obstacle_below_count, obstacle_clear_since, obstacle_last_reading_at
+    global obstacle_below_count, obstacle_last_reading_at
 
     distance, measured_at = robot.get_distance()
 
-    # No fresh reading, or this reading was already processed:
-    # keep the current state.
     if distance is None or measured_at <= obstacle_last_reading_at:
         return
 
     obstacle_last_reading_at = measured_at
 
-    # distance <= 0 means no echo, i.e. nothing in sensor range.
     blocked = 0 < distance <= OBSTACLE_STOP_CM
 
     if not obstacle_mode:
@@ -440,24 +584,12 @@ def update_obstacle_state():
 
         return
 
-    now = time.time()
-
-    if distance <= 0 or distance > OBSTACLE_CLEAR_CM:
-        if obstacle_clear_since is None:
-            obstacle_clear_since = now
-        elif now - obstacle_clear_since >= OBSTACLE_CLEAR_SECONDS:
-            exit_obstacle_mode()
-    else:
-        obstacle_clear_since = None
-
 
 # ----------------------------
 # Vision helpers
 # ----------------------------
 def create_black_mask(roi):
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    # Small blur reduces noise but stays fast.
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
     local_mean = cv2.GaussianBlur(gray, (31, 31), 0)
@@ -565,15 +697,11 @@ def find_line_center_in_roi(frame_small, top_ratio, bottom_ratio, min_area):
 
 
 def detect_line(frame):
-    # Resize only for detection.
-    # The stream still shows captured resolution.
     frame_small = cv2.resize(
         frame,
         (DETECT_WIDTH, DETECT_HEIGHT),
         interpolation=cv2.INTER_AREA,
     )
-
-    h, w = frame_small.shape[:2]
 
     bottom = find_line_center_in_roi(
         frame_small,
@@ -591,8 +719,7 @@ def detect_line(frame):
 
     found_line = bottom["found"] or lookahead["found"]
 
-    # Steering reference. Shift with CENTER_OFFSET_PX if the camera is
-    # mounted slightly off-center.
+    h, w = frame_small.shape[:2]
     reference_x = (w // 2) + CENTER_OFFSET_PX
 
     bottom_error = 0
@@ -604,8 +731,6 @@ def detect_line(frame):
     if lookahead["found"]:
         lookahead_error = lookahead["center_x"] - reference_x
 
-    # Combine current position and upcoming curve.
-    # Bottom is most important, lookahead helps early turn.
     weighted_error = 0
     total_weight = 0
 
@@ -620,7 +745,6 @@ def detect_line(frame):
     if total_weight > 0:
         weighted_error = weighted_error / total_weight
 
-    # Scale detection coordinates to full stream frame for drawing.
     scale_x = FRAME_WIDTH / DETECT_WIDTH
     scale_y = FRAME_HEIGHT / DETECT_HEIGHT
 
@@ -639,14 +763,79 @@ def detect_line(frame):
     }
 
 
+def detect_obstacle_box(frame):
+    global latest_box_detections
+
+    latest_box_detections = []
+
+    if box_model is None:
+        return None, 0.0
+
+    try:
+        results = box_model(frame, verbose=False)
+    except Exception as exc:
+        print(f"YOLO inference failed: {exc}")
+        return None, 0.0
+
+    best_label = None
+    best_conf = 0.0
+
+    for result in results:
+        for box in result.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+
+            if conf < BOX_CONFIDENCE_THRESHOLD:
+                continue
+
+            raw_label = box_model.names[cls_id]
+            label = str(raw_label).lower()
+
+            if "red" in label:
+                normalized_label = "redbox"
+            elif "green" in label:
+                normalized_label = "greenbox"
+            else:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            latest_box_detections.append(
+                {
+                    "label": normalized_label,
+                    "conf": conf,
+                    "xyxy": (x1, y1, x2, y2),
+                }
+            )
+
+            if conf > best_conf:
+                best_label = normalized_label
+                best_conf = conf
+
+    return best_label, best_conf
+
+
+def get_best_box_alignment(frame):
+    if not latest_box_detections:
+        return None
+
+    best_box = max(latest_box_detections, key=lambda item: item["conf"])
+    x1, _y1, x2, _y2 = best_box["xyxy"]
+    box_center_x = (x1 + x2) / 2.0
+    frame_center_x = frame.shape[1] / 2.0
+
+    return {
+        "label": best_box["label"],
+        "conf": best_box["conf"],
+        "error": box_center_x - frame_center_x,
+    }
+
+
 # ----------------------------
 # Decision logic
 # ----------------------------
 def choose_follow_command(detection):
     global smoothed_error, last_follow_action
 
-    # Smooth the steering error so a single noisy frame does not flip
-    # the command back and forth.
     smoothed_error = (
         ERROR_SMOOTHING_ALPHA * detection["weighted_error"]
         + (1.0 - ERROR_SMOOTHING_ALPHA) * smoothed_error
@@ -655,8 +844,6 @@ def choose_follow_command(detection):
     error = smoothed_error
     abs_error = abs(error)
 
-    # Hysteresis: while already pivoting, keep pivoting until the line
-    # is well inside the tolerance band instead of flapping at the edge.
     was_turning = last_follow_action is not None and last_follow_action[1] in ("Q", "E")
 
     if was_turning:
@@ -664,30 +851,48 @@ def choose_follow_command(detection):
     else:
         forward_tolerance = CENTER_TOLERANCE
 
+    # Early curve reaction.
+    if detection["lookahead"]["found"]:
+        lookahead_error = detection["lookahead_error"]
+        abs_lookahead_error = abs(lookahead_error)
+
+        if abs_lookahead_error > CENTER_TOLERANCE:
+            turn_speed = LINE_TURN_SPEED
+
+            if abs_lookahead_error > 90:
+                turn_speed += 7
+            elif abs_lookahead_error > 65:
+                turn_speed += 5
+            elif abs_lookahead_error > 45:
+                turn_speed += 3
+
+            turn_speed = max(20, min(28, turn_speed))
+
+            if lookahead_error < 0:
+                last_follow_action = ("EARLY CURVE LEFT", "Q", turn_speed)
+            else:
+                last_follow_action = ("EARLY CURVE RIGHT", "E", turn_speed)
+
+            return last_follow_action
+
     if abs_error <= forward_tolerance:
         decision = "FORWARD"
         command = "F"
-
-        # Slow a little if lookahead says curve is coming.
-        curve_pressure = abs(detection["lookahead_error"])
-        if curve_pressure > CENTER_TOLERANCE * 2:
-            speed = MIN_FOLLOW_SPEED
-        else:
-            speed = ROBOT_SPEED
+        speed = ROBOT_SPEED
 
         last_follow_action = (decision, command, speed)
         return last_follow_action
 
-    # Dynamic turn speed based on how far line is from center.
-    # Stronger error = stronger pivot.
     turn_speed = LINE_TURN_SPEED
 
     if abs_error > 90:
-        turn_speed = LINE_TURN_SPEED + 4
-    elif abs_error > 55:
-        turn_speed = LINE_TURN_SPEED + 2
+        turn_speed += 11
+    elif abs_error > 65:
+        turn_speed += 9
+    elif abs_error > 45:
+        turn_speed += 3
 
-    turn_speed = max(18, min(24, turn_speed))
+    turn_speed = max(20, min(28, turn_speed))
 
     if error < 0:
         last_follow_action = ("PIVOT LEFT", "Q", turn_speed)
@@ -703,9 +908,6 @@ def choose_recovery_command(detection):
     now = time.time()
     elapsed = now - recovery_phase_started_at
 
-    # Found line during recovery.
-    # Require a few consecutive frames before leaving recovery, so one
-    # noisy frame does not flap the mode and the servo.
     if detection["found_line"]:
         last_line_seen_at = now
         recovery_found_streak += 1
@@ -718,29 +920,9 @@ def choose_recovery_command(detection):
 
     recovery_found_streak = 0
 
-    if recovery_phase == "TURN_RIGHT":
-        set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
-
-        if elapsed < RECOVERY_TURN_SECONDS:
-            return "RECOVERY TURN RIGHT", "E", RECOVERY_TURN_SPEED
-
-        robot.send("S", force=True)
-        set_recovery_phase("CHECK_RIGHT")
-        return "RECOVERY CHECK RIGHT", "S", 0
-
-    if recovery_phase == "CHECK_RIGHT":
-        if elapsed < RECOVERY_CHECK_SECONDS:
-            return "RECOVERY CHECK RIGHT", "S", 0
-
-        set_servo_angle(SERVO_LEFT_SCAN_ANGLE)
-        set_recovery_phase("TURN_LEFT")
-        return "RECOVERY PREP LEFT", "S", 0
-
-    if recovery_phase == "TURN_LEFT":
-        set_servo_angle(SERVO_LEFT_SCAN_ANGLE)
-
-        if elapsed < RECOVERY_TURN_SECONDS:
-            return "RECOVERY TURN LEFT", "Q", RECOVERY_TURN_SPEED
+    if recovery_phase == "SEARCH_LEFT":
+        if elapsed < RECOVERY_SEARCH_TURN_SECONDS:
+            return "RECOVERY SEARCH LEFT", "Q", RECOVERY_TURN_SPEED
 
         robot.send("S", force=True)
         set_recovery_phase("CHECK_LEFT")
@@ -750,25 +932,243 @@ def choose_recovery_command(detection):
         if elapsed < RECOVERY_CHECK_SECONDS:
             return "RECOVERY CHECK LEFT", "S", 0
 
-        set_servo_angle(SERVO_RIGHT_SCAN_ANGLE)
-        set_recovery_phase("TURN_RIGHT")
-        return "RECOVERY RESTART", "S", 0
+        set_recovery_phase("RETURN_CENTER_FROM_LEFT")
+        return "RECOVERY RETURN CENTER", "S", 0
 
-    set_recovery_phase("TURN_RIGHT")
+    if recovery_phase == "RETURN_CENTER_FROM_LEFT":
+        if elapsed < RECOVERY_RETURN_TURN_SECONDS:
+            return "RECOVERY RETURN CENTER FROM LEFT", "E", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_CENTER_1")
+        return "RECOVERY CHECK CENTER", "S", 0
+
+    if recovery_phase == "CHECK_CENTER_1":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK CENTER", "S", 0
+
+        set_recovery_phase("SEARCH_RIGHT")
+        return "RECOVERY PREP RIGHT", "S", 0
+
+    if recovery_phase == "SEARCH_RIGHT":
+        if elapsed < RECOVERY_SEARCH_TURN_SECONDS:
+            return "RECOVERY SEARCH RIGHT", "E", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_RIGHT")
+        return "RECOVERY CHECK RIGHT", "S", 0
+
+    if recovery_phase == "CHECK_RIGHT":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK RIGHT", "S", 0
+
+        set_recovery_phase("RETURN_CENTER_FROM_RIGHT")
+        return "RECOVERY RETURN CENTER", "S", 0
+
+    if recovery_phase == "RETURN_CENTER_FROM_RIGHT":
+        if elapsed < RECOVERY_RETURN_TURN_SECONDS:
+            return "RECOVERY RETURN CENTER FROM RIGHT", "Q", RECOVERY_TURN_SPEED
+
+        robot.send("S", force=True)
+        set_recovery_phase("CHECK_CENTER_2")
+        return "RECOVERY CHECK CENTER", "S", 0
+
+    if recovery_phase == "CHECK_CENTER_2":
+        if elapsed < RECOVERY_CHECK_SECONDS:
+            return "RECOVERY CHECK CENTER", "S", 0
+
+        if RECOVERY_REPEAT_SCAN:
+            set_recovery_phase("SEARCH_LEFT")
+            return "RECOVERY REPEAT SCAN", "S", 0
+
+        return "RECOVERY FAILED STOP", "S", 0
+
+    set_recovery_phase("SEARCH_LEFT")
     return "RECOVERY RESET", "S", 0
 
 
-def decide_robot_action(detection):
+# ============================================================
+# TUNABLE OVERPASS FUNCTIONS - TABLE-DRIVEN PATH
+# ============================================================
+def overpass_begin(label, conf):
+    global obstacle_box_label, obstacle_box_conf, obstacle_overpass_side
+    global overpass_found_line_streak
+    global overpass_steps, overpass_step_index
+    global overpass_back_in_started_at
+
+    obstacle_box_label = label
+    obstacle_box_conf = conf
+    overpass_found_line_streak = 0
+    overpass_step_index = 0
+    overpass_back_in_started_at = 0.0
+
+    if label == "greenbox":
+        obstacle_overpass_side = "LEFT"
+        overpass_steps = LEFT_OVERPASS_STEPS
+        print("GREEN BOX: using tunable LEFT overpass path.")
+    elif label == "redbox":
+        obstacle_overpass_side = "RIGHT"
+        overpass_steps = RIGHT_OVERPASS_STEPS
+        print("RED BOX: using tunable RIGHT overpass path.")
+    else:
+        obstacle_overpass_side = "LEFT"
+        overpass_steps = LEFT_OVERPASS_STEPS
+        print("UNKNOWN BOX: defaulting to tunable LEFT overpass path.")
+
+    set_servo_angle(SERVO_DEFAULT_ANGLE, force=True)
+    set_obstacle_phase("OVERPASS_RUN")
+
+    if overpass_steps:
+        print(f"Overpass step: {overpass_steps[0]['name']}")
+
+
+def overpass_go_next_step():
+    global overpass_step_index, obstacle_phase_started_at
+    global overpass_back_in_started_at
+
+    overpass_step_index += 1
+    obstacle_phase_started_at = time.time()
+
+    if overpass_step_index >= len(overpass_steps):
+        # Repeat last 2 steps forever until line found or timeout.
+        # These should be the back-in/search-line steps.
+        overpass_step_index = max(0, len(overpass_steps) - 2)
+
+    current_step = overpass_steps[overpass_step_index]
+
+    if current_step.get("check_line", False) and overpass_back_in_started_at <= 0:
+        overpass_back_in_started_at = time.time()
+
+    print(f"Overpass step: {current_step['name']}")
+
+
+def overpass_try_resume_line_follow(detection):
+    global overpass_found_line_streak
+
+    if detection["found_line"]:
+        overpass_found_line_streak += 1
+
+        if overpass_found_line_streak >= OVERPASS_EXIT_FOUND_FRAMES:
+            exit_obstacle_mode()
+            return choose_follow_command(detection)
+    else:
+        overpass_found_line_streak = 0
+
+    return None
+
+
+def overpass_command(detection):
+    global overpass_step_index
+    global obstacle_phase_started_at
+
+    now = time.time()
+
+    if now < overpass_brake_until:
+        return "OVERPASS BRAKE", "S", 0
+
+    if not overpass_steps:
+        robot.send("S", force=True)
+        exit_obstacle_mode()
+        start_recovery()
+        return "OVERPASS NO STEPS", "S", 0
+
+    if overpass_step_index >= len(overpass_steps):
+        overpass_step_index = len(overpass_steps) - 1
+
+    current_step = overpass_steps[overpass_step_index]
+    elapsed = now - obstacle_phase_started_at
+
+    # Only detect line again during return/search steps.
+    if current_step.get("check_line", False):
+        resumed = overpass_try_resume_line_follow(detection)
+        if resumed is not None:
+            return resumed
+
+    if elapsed < current_step["seconds"]:
+        return (
+            current_step["name"],
+            current_step["command"],
+            current_step["speed"],
+        )
+
+    robot.send("S", force=True)
+    overpass_go_next_step()
+
+    current_step = overpass_steps[overpass_step_index]
+
+    return (
+        current_step["name"],
+        current_step["command"],
+        current_step["speed"],
+    )
+
+
+def choose_obstacle_command(detection, frame):
+    global last_line_seen_at
+
+    now = time.time()
+    elapsed = now - obstacle_phase_started_at
+
+    # While obstacle handling, prevent normal lost-line recovery from triggering.
+    last_line_seen_at = now
+
+    if obstacle_phase == "SCAN_SETTLE":
+        set_servo_angle(SERVO_OBSTACLE_ANGLE)
+
+        if elapsed < OBSTACLE_SERVO_SETTLE_SECONDS:
+            return "OBSTACLE SCAN SETTLE", "S", 0
+
+        set_obstacle_phase("SCAN_BOX")
+        return "OBSTACLE SCAN BOX", "S", 0
+
+    if obstacle_phase == "SCAN_BOX":
+        set_servo_angle(SERVO_OBSTACLE_ANGLE)
+        label, conf = detect_obstacle_box(frame)
+
+        if label is None:
+            if elapsed >= OBSTACLE_SCAN_BOX_TIMEOUT_SECONDS:
+                robot.send("S", force=True)
+                exit_obstacle_mode()
+
+                if detection["found_line"]:
+                    return choose_follow_command(detection)
+
+                start_recovery()
+                return "OBSTACLE BOX TIMEOUT", "S", 0
+
+            if box_model is None:
+                return "OBSTACLE NO YOLO MODEL", "S", 0
+
+            return "OBSTACLE LOOKING BOX", "S", 0
+
+        overpass_begin(label, conf)
+        return f"{label.upper()} TUNABLE OVERPASS START", "S", 0
+
+    if obstacle_phase == "OVERPASS_RUN":
+        set_servo_angle(SERVO_DEFAULT_ANGLE)
+
+        if (
+            overpass_back_in_started_at > 0
+            and now - overpass_back_in_started_at > OVERPASS_BACK_IN_TOTAL_TIMEOUT_SECONDS
+        ):
+            robot.send("S", force=True)
+            exit_obstacle_mode()
+            start_recovery()
+            return "OVERPASS BACK IN TIMEOUT", "S", 0
+
+        return overpass_command(detection)
+
+    set_obstacle_phase("SCAN_SETTLE")
+    return "OBSTACLE RESET", "S", 0
+
+
+def decide_robot_action(detection, frame):
     global last_line_seen_at, last_follow_action
 
     now = time.time()
 
     if obstacle_mode:
-        # Hold position with the camera lifted. Keep the line timer
-        # fresh so recovery does not fire the moment the path clears.
-        set_servo_angle(SERVO_OBSTACLE_ANGLE)
-        last_line_seen_at = now
-        return "OBSTACLE STOP", "S", 0
+        return choose_obstacle_command(detection, frame)
 
     if recovery_mode:
         return choose_recovery_command(detection)
@@ -787,15 +1187,8 @@ def decide_robot_action(detection):
         start_recovery()
         return "START RECOVERY", "S", 0
 
-    # Briefly keep moving only if the last command was forward. Repeating
-    # a pivot after the line disappears makes the robot rotate farther away
-    # from the line and enter recovery with a bigger error.
+    # Do not coast forward when line is lost.
     if last_follow_action is not None:
-        decision, command, speed = last_follow_action
-
-        if command == "F":
-            return "LINE LOST COAST", command, speed
-
         last_follow_action = None
         return "LINE LOST WAIT", "S", 0
 
@@ -845,8 +1238,6 @@ def draw_debug(frame, detection, decision, command, speed):
     else:
         color = (0, 0, 255)
 
-    # Draw center/tolerance lines based on stream size.
-    # Uses the (possibly offset) steering reference, not the raw middle.
     center_x = int(detection["reference_x"] * scale_x)
     tolerance_full = int(CENTER_TOLERANCE * scale_x)
 
@@ -920,13 +1311,55 @@ def draw_debug(frame, detection, decision, command, speed):
 
     cv2.putText(
         frame,
-        f"MODE {mode_text} | PHASE {recovery_phase} | DIST {distance_text}",
+        f"MODE {mode_text} | RECOVERY {recovery_phase} | DIST {distance_text}",
         (10, 124),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.54,
         (255, 255, 255),
         2,
     )
+
+    step_text = "--"
+    if obstacle_mode and obstacle_phase == "OVERPASS_RUN" and overpass_steps:
+        safe_index = min(overpass_step_index, len(overpass_steps) - 1)
+        step_text = overpass_steps[safe_index]["name"]
+
+    cv2.putText(
+        frame,
+        f"OBSTACLE {obstacle_phase} | BOX {obstacle_box_label or '--'} {obstacle_box_conf:.2f} | SIDE {obstacle_overpass_side or '--'}",
+        (10, 154),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.54,
+        (255, 255, 255),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"OVERPASS STEP {overpass_step_index}: {step_text}",
+        (10, 184),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (255, 255, 255),
+        2,
+    )
+
+    for box in latest_box_detections:
+        x1, y1, x2, y2 = box["xyxy"]
+        label = box["label"]
+        conf = box["conf"]
+        box_color = (0, 255, 0) if label == "greenbox" else (0, 0, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(
+            frame,
+            f"{label} {conf:.2f}",
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            box_color,
+            2,
+        )
 
 
 # ----------------------------
@@ -967,24 +1400,20 @@ def publish_status_frame(message):
 # Camera
 # ----------------------------
 def open_camera():
-    # V4L2 often gives lower latency on Raspberry Pi/Linux.
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
 
-    # Ask camera for MJPG to reduce USB bandwidth/CPU pressure.
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
-    # Important: reduce old-frame buffering.
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
         cap.release()
         return None
 
-    # Throw away a few startup frames.
     for _ in range(3):
         cap.read()
 
@@ -1030,7 +1459,6 @@ def camera_control_loop():
                     time.sleep(CAMERA_REOPEN_DELAY_SECONDS)
                     continue
 
-            # Grab/retrieve helps keep latest frame fresher on some cameras.
             ok = cap.grab()
             if not ok:
                 frame = None
@@ -1053,7 +1481,6 @@ def camera_control_loop():
                 print("Camera frames returned.")
                 camera_read_failed = False
 
-            # Some cameras ignore requested resolution, so resize stream frame for consistency.
             if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
                 frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
 
@@ -1061,7 +1488,7 @@ def camera_control_loop():
             update_obstacle_state()
 
             detection = detect_line(frame)
-            decision, command, speed = decide_robot_action(detection)
+            decision, command, speed = decide_robot_action(detection, frame)
 
             robot.send(command, speed)
 
@@ -1149,7 +1576,7 @@ def index():
 <body>
     <h1>Robot Line Detection</h1>
     <div class="hint">
-        Capture 640x360, detect 320x180. Two ROI line tracking: lookahead + bottom.
+        Capture 640x480, detect 320x240. Tunable green/red obstacle overpass controller.
     </div>
     <img src="/video_feed" alt="Robot camera stream">
 </body>
